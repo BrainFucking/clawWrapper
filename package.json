@@ -1,0 +1,29 @@
+{
+  "name": "clawwrapper",
+  "version": "1.0.0",
+  "description": "Cross-platform OpenClaw installer, setup, and uninstaller toolkit.",
+  "main": "dist/cli/src/index.js",
+  "bin": {
+    "claw-wrapper": "dist/cli/src/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx cli/src/index.ts",
+    "test": "tsx tests/smoke.test.ts",
+    "bundle:openclaw:github-tarballs": "node scripts/bundle-openclaw-github-tarballs.mjs",
+    "bootstrap:unix": "bash ./scripts/install.sh",
+    "bootstrap:windows": "powershell -ExecutionPolicy Bypass -File ./scripts/install.ps1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.58.2"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
