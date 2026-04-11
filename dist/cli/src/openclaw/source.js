@@ -12,7 +12,7 @@ const platform_1 = require("../utils/platform");
 exports.LOCAL_OPENCLAW_SOURCE_RELATIVE = "vendor/openclaw";
 exports.LOCAL_OPENCLAW_SOURCE_ABSOLUTE = (0, node_path_1.join)(process.cwd(), "vendor", "openclaw");
 exports.STABLE_OPENCLAW_SOURCE_ABSOLUTE = (0, node_path_1.join)(process.env.OPENCLAW_STABLE_SOURCE_DIR?.trim() || process.env.HOME || process.cwd(), ".openclaw-source");
-exports.OPENCLAW_PINNED_REF = process.env.OPENCLAW_PINNED_REF?.trim() || "v2026.3.8";
+exports.OPENCLAW_PINNED_REF = process.env.OPENCLAW_PINNED_REF?.trim() || "v2026.4.10";
 async function pathExists(path) {
     try {
         await (0, promises_1.access)(path);

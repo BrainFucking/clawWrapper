@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $RootDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $OpenClawSourceDir = Join-Path $RootDir "vendor\openclaw"
-$OpenClawPinnedRef = if ($env:OPENCLAW_PINNED_REF) { $env:OPENCLAW_PINNED_REF } else { "v2026.3.8" }
+$OpenClawPinnedRef = if ($env:OPENCLAW_PINNED_REF) { $env:OPENCLAW_PINNED_REF } else { "v2026.4.10" }
 $NpmRegistry = if ($env:CLAW_WRAPPER_NPM_REGISTRY) { $env:CLAW_WRAPPER_NPM_REGISTRY } else { "https://registry.npmmirror.com" }
 $env:NPM_CONFIG_REGISTRY = $NpmRegistry
 $env:npm_config_registry = $NpmRegistry

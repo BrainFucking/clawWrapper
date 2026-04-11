@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 OPENCLAW_SOURCE_DIR="${ROOT_DIR}/vendor/openclaw"
-OPENCLAW_PINNED_REF="${OPENCLAW_PINNED_REF:-v2026.3.8}"
+OPENCLAW_PINNED_REF="${OPENCLAW_PINNED_REF:-v2026.4.10}"
 NPM_REGISTRY="${CLAW_WRAPPER_NPM_REGISTRY:-https://registry.npmmirror.com}"
 export NPM_CONFIG_REGISTRY="$NPM_REGISTRY"
 export npm_config_registry="$NPM_REGISTRY"

@@ -92,7 +92,7 @@ Default install mode uses China mirror registry (`https://registry.npmmirror.com
 
 ## Pinned OpenClaw version policy
 
-- The installer uses a pinned OpenClaw ref (default: `v2026.3.8`) for reproducible local builds.
+- The installer uses a pinned OpenClaw ref (default: `v2026.4.10`) for reproducible local builds.
 - Override temporarily with environment variable `OPENCLAW_PINNED_REF` if you must test another ref.
 - If the pinned ref is unavailable in local tags, wrapper auto-falls back to the latest stable non-beta tag and logs the fallback.
 - During install/UI startup, wrapper validates `vendor/openclaw` git repo, fetches tags, and checks out pinned ref when safe.

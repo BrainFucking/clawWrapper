@@ -28,7 +28,7 @@ On Windows it uses `winget`/`choco`, then falls back to `nvm-windows`.
 
 Both Unix and Windows bootstraps now ensure `pnpm` availability (corepack first, npm fallback).
 Installation uses local OpenClaw source from `vendor/openclaw` and does not run `git clone`.
-Install flow validates and pins `vendor/openclaw` to a stable ref (default `v2026.3.8`; override with `OPENCLAW_PINNED_REF`).
+Install flow validates and pins `vendor/openclaw` to a stable ref (default `v2026.4.10`; override with `OPENCLAW_PINNED_REF`).
 Install flow defaults to mirror registry `https://registry.npmmirror.com`.
 
 Windows optional flags:
@@ -71,7 +71,7 @@ npm run bundle:openclaw:github-tarballs
 
 Pinned version workflow:
 
-- Default pinned ref: `v2026.3.8`
+- Default pinned ref: `v2026.4.10`
 - Override once: `OPENCLAW_PINNED_REF=<tag-or-sha> npx tsx cli/src/index.ts install --method local`
 - If pinned ref is missing locally, wrapper falls back to latest stable non-beta tag and prints the selected tag in logs.
 - If install reports source mismatch, run:

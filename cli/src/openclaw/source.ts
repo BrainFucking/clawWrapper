@@ -9,7 +9,7 @@ export const STABLE_OPENCLAW_SOURCE_ABSOLUTE = join(
   process.env.OPENCLAW_STABLE_SOURCE_DIR?.trim() || process.env.HOME || process.cwd(),
   ".openclaw-source",
 );
-export const OPENCLAW_PINNED_REF = process.env.OPENCLAW_PINNED_REF?.trim() || "v2026.3.8";
+export const OPENCLAW_PINNED_REF = process.env.OPENCLAW_PINNED_REF?.trim() || "v2026.4.10";
 
 export interface StableSourceResult {
   ok: boolean;
