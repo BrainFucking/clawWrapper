@@ -16,7 +16,36 @@ References:
 - [OpenClaw Install Docs](https://docs.openclaw.ai/install)
 - [OpenClaw Installer Script](https://openclaw.ai/install.sh)
 
-## Quick start
+## Quick start (install + manage via UI)
+
+On **macOS**, the usual workflow is to run the manager launcher once; it bootstraps what is missing and opens **OpenClaw 管理工具** (install, config, Feishu/OneThing flows, uninstall, etc.):
+
+```bash
+open ./scripts/start-ui.command
+```
+
+Or from Terminal (same script):
+
+```bash
+bash ./scripts/start-ui.command
+```
+
+Double-click **`start-ui.command`** in Finder if the file is executable; macOS runs it in Terminal.
+
+What the launcher does in short:
+
+- Loads your shell `PATH` (e.g. from `~/.zshrc`) so `node` / `pnpm` / `openclaw` resolve the same as in an interactive shell.
+- If **Node.js/npm** are missing, runs **`scripts/install.sh`** once, then continues.
+- Runs **`pnpm install`** when `node_modules` is missing or incomplete.
+- Repairs **OpenClaw** under `vendor/openclaw` when the local mirror looks broken (install / UI build / build as needed).
+- Starts **`manager:ui`** with `~/.openclaw/config.json` and `./.env.openclaw`.
+
+Optional environment variables (see script for defaults):
+
+- **`OPENCLAW_PINNED_REF`** — OpenClaw git ref (default pinned in repo).
+- **`CLAW_WRAPPER_NPM_REGISTRY`** — npm registry for installs (default: npmmirror).
+
+For a **manual** dev build without the launcher:
 
 ```bash
 pnpm install
@@ -101,6 +130,8 @@ npx tsx cli/src/index.ts uninstall --purge-all
 ```
 
 ## OpenClaw 管理工具 UI
+
+Primary entry on macOS: **`scripts/start-ui.command`** (see the **Quick start** section).
 
 - Title updated to `OpenClaw 管理工具`
 - Startup route split by runtime state:
