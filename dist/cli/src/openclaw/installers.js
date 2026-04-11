@@ -69,8 +69,16 @@ async function installOpenClaw(options) {
     if (!(0, platform_1.isNodeVersionSupported)()) {
         report.warnings.push(`Node ${process.versions.node} detected. OpenClaw docs recommend Node 22+.`);
     }
+    const stableSource = options.dryRun
+        ? { ok: true, sourceDir: "vendor/openclaw", copied: false }
+        : await (0, source_1.ensureStableOpenClawSource)();
+    if (!stableSource.ok) {
+        report.errors.push(stableSource.message ?? "Failed to prepare stable OpenClaw source directory.");
+        return report;
+    }
+    const sourceDir = stableSource.sourceDir;
     if (!options.dryRun) {
-        const sourcePrepared = await (0, source_1.preparePinnedOpenClawSource)(source_1.LOCAL_OPENCLAW_SOURCE_ABSOLUTE, source_1.OPENCLAW_PINNED_REF);
+        const sourcePrepared = await (0, source_1.preparePinnedOpenClawSource)(sourceDir, source_1.OPENCLAW_PINNED_REF);
         if (!sourcePrepared.ok) {
             report.errors.push(`OpenClaw source preparation failed (${source_1.OPENCLAW_PINNED_REF}): ${sourcePrepared.message ?? "unknown error"}`);
             return report;
@@ -78,9 +86,9 @@ async function installOpenClaw(options) {
         if (sourcePrepared.fallbackUsed) {
             report.warnings.push(`Pinned ref ${source_1.OPENCLAW_PINNED_REF} not found; using fallback stable ref ${sourcePrepared.resolvedRef}.`);
         }
-        const missingFiles = await (0, source_1.verifyOpenClawSourcePreflight)(source_1.LOCAL_OPENCLAW_SOURCE_ABSOLUTE);
+        const missingFiles = await (0, source_1.verifyOpenClawSourcePreflight)(sourceDir);
         if (missingFiles.length > 0) {
-            report.errors.push(`OpenClaw source preflight failed. Missing files in ${source_1.LOCAL_OPENCLAW_SOURCE_ABSOLUTE}: ${missingFiles.join(", ")}`);
+            report.errors.push(`OpenClaw source preflight failed. Missing files in ${sourceDir}: ${missingFiles.join(", ")}`);
             return report;
         }
     }
@@ -92,14 +100,14 @@ async function installOpenClaw(options) {
         report.warnings.push(`Install method '${options.method}' is deprecated; using local source install.`);
     }
     if (!options.dryRun) {
-        const githubTarballs = await (0, githubTarballs_1.prepareGithubTarballsForInstall)(source_1.LOCAL_OPENCLAW_SOURCE_ABSOLUTE);
+        const githubTarballs = await (0, githubTarballs_1.prepareGithubTarballsForInstall)(sourceDir);
         if (!githubTarballs.ok) {
             report.errors.push(githubTarballs.error ?? "GitHub tarball bundle preparation failed.");
             return report;
         }
         for (const file of githubTarballs.files) {
             const seed = await (0, exec_1.runCommand)("pnpm", ["store", "add", file], {
-                cwd: source_1.LOCAL_OPENCLAW_SOURCE_ABSOLUTE,
+                cwd: sourceDir,
                 dryRun: options.dryRun,
                 streamOutput: true,
                 env: installEnv,
@@ -118,7 +126,7 @@ async function installOpenClaw(options) {
     ]) {
         report.steps.push(step.title);
         const result = await (0, exec_1.runCommand)("pnpm", step.args, {
-            cwd: source_1.LOCAL_OPENCLAW_SOURCE_ABSOLUTE,
+            cwd: sourceDir,
             dryRun: options.dryRun,
             streamOutput: true,
             env: installEnv,

@@ -42,7 +42,7 @@ async function testConfigValidation() {
         feishu: { appId: "", appSecret: "", botName: "bot", webhookUrl: "" },
     };
     const errors = (0, config_1.validateConfig)(badConfig);
-    strict_1.default.equal(errors.length, 3, "expected three validation errors");
+    strict_1.default.equal(errors.length, 6, "expected six validation errors");
 }
 async function testSaveAndEnv() {
     const tempDir = await (0, promises_1.mkdtemp)(node_path_1.default.join(node_os_1.default.tmpdir(), "claw-wrapper-test-"));

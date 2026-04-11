@@ -2,8 +2,8 @@ import { commandExists, isNodeVersionSupported } from "../utils/platform";
 import { runCommand } from "../utils/exec";
 import { mkdir } from "node:fs/promises";
 import {
-  LOCAL_OPENCLAW_SOURCE_ABSOLUTE,
   OPENCLAW_PINNED_REF,
+  ensureStableOpenClawSource,
   preparePinnedOpenClawSource,
   verifyOpenClawSourcePreflight,
 } from "./source";
@@ -93,8 +93,17 @@ export async function installOpenClaw(options: InstallOptions): Promise<InstallR
     );
   }
 
+  const stableSource = options.dryRun
+    ? { ok: true, sourceDir: "vendor/openclaw", copied: false }
+    : await ensureStableOpenClawSource();
+  if (!stableSource.ok) {
+    report.errors.push(stableSource.message ?? "Failed to prepare stable OpenClaw source directory.");
+    return report;
+  }
+  const sourceDir = stableSource.sourceDir;
+
   if (!options.dryRun) {
-    const sourcePrepared = await preparePinnedOpenClawSource(LOCAL_OPENCLAW_SOURCE_ABSOLUTE, OPENCLAW_PINNED_REF);
+    const sourcePrepared = await preparePinnedOpenClawSource(sourceDir, OPENCLAW_PINNED_REF);
     if (!sourcePrepared.ok) {
       report.errors.push(
         `OpenClaw source preparation failed (${OPENCLAW_PINNED_REF}): ${sourcePrepared.message ?? "unknown error"}`,
@@ -106,10 +115,10 @@ export async function installOpenClaw(options: InstallOptions): Promise<InstallR
         `Pinned ref ${OPENCLAW_PINNED_REF} not found; using fallback stable ref ${sourcePrepared.resolvedRef}.`,
       );
     }
-    const missingFiles = await verifyOpenClawSourcePreflight(LOCAL_OPENCLAW_SOURCE_ABSOLUTE);
+    const missingFiles = await verifyOpenClawSourcePreflight(sourceDir);
     if (missingFiles.length > 0) {
       report.errors.push(
-        `OpenClaw source preflight failed. Missing files in ${LOCAL_OPENCLAW_SOURCE_ABSOLUTE}: ${missingFiles.join(", ")}`,
+        `OpenClaw source preflight failed. Missing files in ${sourceDir}: ${missingFiles.join(", ")}`,
       );
       return report;
     }
@@ -124,14 +133,14 @@ export async function installOpenClaw(options: InstallOptions): Promise<InstallR
   }
 
   if (!options.dryRun) {
-    const githubTarballs = await prepareGithubTarballsForInstall(LOCAL_OPENCLAW_SOURCE_ABSOLUTE);
+    const githubTarballs = await prepareGithubTarballsForInstall(sourceDir);
     if (!githubTarballs.ok) {
       report.errors.push(githubTarballs.error ?? "GitHub tarball bundle preparation failed.");
       return report;
     }
     for (const file of githubTarballs.files) {
       const seed = await runCommand("pnpm", ["store", "add", file], {
-        cwd: LOCAL_OPENCLAW_SOURCE_ABSOLUTE,
+        cwd: sourceDir,
         dryRun: options.dryRun,
         streamOutput: true,
         env: installEnv,
@@ -151,7 +160,7 @@ export async function installOpenClaw(options: InstallOptions): Promise<InstallR
   ]) {
     report.steps.push(step.title);
     const result = await runCommand("pnpm", step.args, {
-      cwd: LOCAL_OPENCLAW_SOURCE_ABSOLUTE,
+      cwd: sourceDir,
       dryRun: options.dryRun,
       streamOutput: true,
       env: installEnv,

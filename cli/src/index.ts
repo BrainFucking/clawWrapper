@@ -36,7 +36,7 @@ claw-wrapper - OpenClaw installer toolkit
 
 Usage:
   claw-wrapper install [--method auto|local] [--dry-run] [--no-onboard]
-  claw-wrapper feishu:setup [--bot-name "Claw Assistant"] [--output ./.feishu-bot.json] [--headless]
+  claw-wrapper feishu:setup [--bot-name "Claw Assistant"] [--output ./.feishu-bot.json] [--headless] [--engine v1|v2] [--resume-run-id <id>] [--secret-store memory|file] [--webhook-probe]
   claw-wrapper configure [--config <path>] [--env-out <path>] [--dry-run]
   claw-wrapper configure:ui [--config <path>] [--env-out <path>] [--host 127.0.0.1] [--port 18791] [--no-open]
   claw-wrapper manager:ui [--config <path>] [--env-out <path>] [--host 127.0.0.1] [--port 18791] [--no-open]
@@ -61,6 +61,12 @@ async function main(): Promise<void> {
         botName: (flags["bot-name"] as string) ?? "Claw Assistant",
         outputPath: (flags.output as string) ?? "./.feishu-bot.json",
         headless: Boolean(flags.headless),
+        engine: ((flags.engine as string) === "v2" ? "v2" : "v1") as "v1" | "v2",
+        resumeRunId: flags["resume-run-id"] as string | undefined,
+        secretStore: ((flags["secret-store"] as string) === "file" ? "file" : "memory") as
+          | "memory"
+          | "file",
+        webhookProbe: Boolean(flags["webhook-probe"]),
       });
       break;
     case "configure":

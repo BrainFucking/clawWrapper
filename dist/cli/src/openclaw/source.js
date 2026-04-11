@@ -1,7 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OPENCLAW_PINNED_REF = exports.LOCAL_OPENCLAW_SOURCE_ABSOLUTE = exports.LOCAL_OPENCLAW_SOURCE_RELATIVE = void 0;
+exports.OPENCLAW_PINNED_REF = exports.STABLE_OPENCLAW_SOURCE_ABSOLUTE = exports.LOCAL_OPENCLAW_SOURCE_ABSOLUTE = exports.LOCAL_OPENCLAW_SOURCE_RELATIVE = void 0;
 exports.pathExists = pathExists;
+exports.ensureStableOpenClawSource = ensureStableOpenClawSource;
 exports.verifyOpenClawSourcePreflight = verifyOpenClawSourcePreflight;
 exports.preparePinnedOpenClawSource = preparePinnedOpenClawSource;
 const promises_1 = require("node:fs/promises");
@@ -10,6 +11,7 @@ const exec_1 = require("../utils/exec");
 const platform_1 = require("../utils/platform");
 exports.LOCAL_OPENCLAW_SOURCE_RELATIVE = "vendor/openclaw";
 exports.LOCAL_OPENCLAW_SOURCE_ABSOLUTE = (0, node_path_1.join)(process.cwd(), "vendor", "openclaw");
+exports.STABLE_OPENCLAW_SOURCE_ABSOLUTE = (0, node_path_1.join)(process.env.OPENCLAW_STABLE_SOURCE_DIR?.trim() || process.env.HOME || process.cwd(), ".openclaw-source");
 exports.OPENCLAW_PINNED_REF = process.env.OPENCLAW_PINNED_REF?.trim() || "v2026.3.8";
 async function pathExists(path) {
     try {
@@ -19,6 +21,52 @@ async function pathExists(path) {
     catch {
         return false;
     }
+}
+async function getHeadCommit(cwd) {
+    const resolved = await git(["rev-parse", "HEAD"], cwd);
+    return resolved.code === 0 ? resolved.stdout.trim() : "";
+}
+async function ensureStableOpenClawSource(log) {
+    const workspaceSourceDir = exports.LOCAL_OPENCLAW_SOURCE_ABSOLUTE;
+    const stableSourceDir = exports.STABLE_OPENCLAW_SOURCE_ABSOLUTE;
+    const packageJsonPath = (0, node_path_1.join)(workspaceSourceDir, "package.json");
+    if (!(await pathExists(packageJsonPath))) {
+        return {
+            ok: false,
+            sourceDir: stableSourceDir,
+            copied: false,
+            message: `Local OpenClaw source not found at ${workspaceSourceDir}.`,
+        };
+    }
+    const stablePackageJsonPath = (0, node_path_1.join)(stableSourceDir, "package.json");
+    if ((await pathExists(stablePackageJsonPath)) && (await pathExists((0, node_path_1.join)(stableSourceDir, ".git")))) {
+        const workspaceHead = await getHeadCommit(workspaceSourceDir);
+        const stableHead = await getHeadCommit(stableSourceDir);
+        if (workspaceHead && stableHead && workspaceHead === stableHead) {
+            log?.(`Reusing stable OpenClaw source: ${stableSourceDir} (${workspaceHead.slice(0, 8)})`);
+            return {
+                ok: true,
+                sourceDir: stableSourceDir,
+                copied: false,
+            };
+        }
+    }
+    const tmpDir = `${stableSourceDir}.tmp`;
+    log?.(`Syncing OpenClaw source to stable directory: ${stableSourceDir}`);
+    await (0, promises_1.rm)(tmpDir, { recursive: true, force: true });
+    await (0, promises_1.mkdir)(tmpDir, { recursive: true });
+    await (0, promises_1.cp)(workspaceSourceDir, tmpDir, {
+        recursive: true,
+        force: true,
+        filter: (src) => !src.includes("/node_modules/") && !src.endsWith("/node_modules"),
+    });
+    await (0, promises_1.rm)(stableSourceDir, { recursive: true, force: true });
+    await (0, promises_1.rename)(tmpDir, stableSourceDir);
+    return {
+        ok: true,
+        sourceDir: stableSourceDir,
+        copied: true,
+    };
 }
 async function git(args, cwd) {
     return await (0, exec_1.runCommand)("git", args, { cwd });

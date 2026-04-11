@@ -93,6 +93,7 @@ Default install mode uses China mirror registry (`https://registry.npmmirror.com
 ```bash
 npx tsx cli/src/index.ts install --method local
 npx tsx cli/src/index.ts feishu:setup --bot-name "Claw Assistant" --output ./.feishu-bot.json
+npx tsx cli/src/index.ts feishu:setup --engine v2 --bot-name "Claw Assistant" --output ./.feishu-bot.json --secret-store file
 npx tsx cli/src/index.ts configure --config ~/.openclaw/config.json --env-out ./.env.openclaw
 npx tsx cli/src/index.ts configure:ui --config ~/.openclaw/config.json --env-out ./.env.openclaw
 npx tsx cli/src/index.ts manager:ui --config ~/.openclaw/config.json --env-out ./.env.openclaw
@@ -135,4 +136,5 @@ This approach is intentionally semi-automated for stability.
 ## Docs
 
 - See [docs/usage.md](docs/usage.md) for command details.
+- See [docs/feishu-automation-v2.md](docs/feishu-automation-v2.md) for v2 Feishu automation architecture.
 - See [templates/openclaw.config.example.json](templates/openclaw.config.example.json) for config format.

@@ -38,7 +38,7 @@ async function testConfigValidation(): Promise<void> {
     feishu: { appId: "", appSecret: "", botName: "bot", webhookUrl: "" },
   };
   const errors = validateConfig(badConfig);
-  assert.equal(errors.length, 3, "expected three validation errors");
+  assert.equal(errors.length, 6, "expected six validation errors");
 }
 
 async function testSaveAndEnv(): Promise<void> {

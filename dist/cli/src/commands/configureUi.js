@@ -4,15 +4,18 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.runConfigureUiCommand = runConfigureUiCommand;
+const node_fs_1 = require("node:fs");
 const promises_1 = require("node:fs/promises");
 const node_http_1 = __importDefault(require("node:http"));
 const node_child_process_1 = require("node:child_process");
+const node_os_1 = require("node:os");
 const node_path_1 = require("node:path");
 const exec_1 = require("../utils/exec");
 const platform_1 = require("../utils/platform");
 const config_1 = require("../openclaw/config");
 const githubTarballs_1 = require("../openclaw/githubTarballs");
 const source_1 = require("../openclaw/source");
+let cachedProjectRoot = null;
 const chatMessages = [];
 let installJob = {
     running: false,
@@ -45,6 +48,24 @@ let uninstallJob = {
 let installChild = null;
 let lastInstallStatusLogAt = 0;
 let lastUninstallStatusLogAt = 0;
+let lastMaintenanceStatusLogAt = 0;
+let maintenanceJob = {
+    running: false,
+    completed: false,
+    ok: false,
+    kind: "idle",
+    progress: 0,
+    title: "idle",
+    logs: [],
+    currentStep: "",
+    currentCommand: "",
+    currentPid: null,
+    stepStartedAt: null,
+    lastActivityAt: null,
+    lastExitCode: null,
+    lastExitSignal: null,
+    lastFailureReason: "",
+};
 function debugLog(message, data) {
     const ts = new Date().toISOString();
     if (data === undefined) {
@@ -65,6 +86,56 @@ function escapeHtml(value) {
         .replaceAll(">", "&gt;")
         .replaceAll("\"", "&quot;")
         .replaceAll("'", "&#39;");
+}
+function resolveHomeDir() {
+    return process.env.HOME ?? process.env.USERPROFILE ?? ".";
+}
+function getOpenClawDir() {
+    return (0, node_path_1.join)(resolveHomeDir(), ".openclaw");
+}
+function getOpenClawSetupResultPath(kind) {
+    const home = resolveHomeDir();
+    const file = kind === "onething" ? "onething-setup-result.json" : "feishu-setup-result.json";
+    return (0, node_path_1.join)(home, ".openclaw", file);
+}
+function getOpenClawDotEnvPath() {
+    return (0, node_path_1.join)(resolveHomeDir(), ".openclaw", ".env");
+}
+async function tryReadJsonFile(filePath) {
+    try {
+        const raw = await (0, promises_1.readFile)(filePath, "utf8");
+        return JSON.parse(raw);
+    }
+    catch {
+        return null;
+    }
+}
+function maskSecret(value, head = 3, tail = 3) {
+    const v = value ?? "";
+    const trimmed = v.trim();
+    if (!trimmed)
+        return "";
+    if (trimmed.length <= head + tail) {
+        return `${trimmed.slice(0, Math.max(1, head))}***`;
+    }
+    return `${trimmed.slice(0, head)}...${trimmed.slice(-tail)}`;
+}
+function upsertDotEnvVar(envText, key, value) {
+    const lines = (envText || "").split(/\r?\n/);
+    const prefix = `${key}=`;
+    let found = false;
+    const next = lines.map((line) => {
+        const trimmed = line.trimStart();
+        if (trimmed.startsWith(prefix)) {
+            found = true;
+            return `${key}=${value}`;
+        }
+        return line;
+    });
+    if (!found) {
+        next.push(`${key}=${value}`);
+    }
+    return next.join("\n").trimEnd() + "\n";
 }
 function openInBrowser(url) {
     if (process.platform === "darwin") {
@@ -201,6 +272,24 @@ async function reloadProcessPathFromZshrc(log) {
         log("已执行 source ~/.zshrc，并刷新当前进程 PATH。");
     }
 }
+async function resolveProjectRoot() {
+    if (cachedProjectRoot) {
+        return cachedProjectRoot;
+    }
+    const candidates = [
+        process.cwd(),
+        (0, node_path_1.join)(__dirname, "..", "..", ".."),
+        (0, node_path_1.join)(__dirname, "..", "..", "..", ".."),
+    ];
+    for (const candidate of candidates) {
+        if ((await (0, source_1.pathExists)((0, node_path_1.join)(candidate, "package.json"))) && (await (0, source_1.pathExists)((0, node_path_1.join)(candidate, "automation")))) {
+            cachedProjectRoot = candidate;
+            return candidate;
+        }
+    }
+    cachedProjectRoot = process.cwd();
+    return cachedProjectRoot;
+}
 async function ensurePnpmAvailable(log) {
     const mirrorEnv = (0, githubTarballs_1.withMirrorRegistry)();
     if (await (0, platform_1.commandExists)("pnpm")) {
@@ -251,6 +340,51 @@ async function ensurePnpmAvailable(log) {
         }
     }
     return false;
+}
+function prependExistingBinDirs(dirs) {
+    const current = process.env.PATH ?? "";
+    const parts = current.split(process.platform === "win32" ? ";" : ":").filter(Boolean);
+    const sep = process.platform === "win32" ? ";" : ":";
+    const next = [];
+    for (const dir of dirs) {
+        if (!dir || parts.includes(dir)) {
+            continue;
+        }
+        next.push(dir);
+    }
+    if (next.length > 0) {
+        process.env.PATH = `${next.join(sep)}${sep}${current}`;
+    }
+}
+function addCommonUserBinDirsToPath() {
+    const home = process.env.HOME ?? "";
+    const candidates = process.platform === "darwin"
+        ? [
+            `${home}/Library/pnpm`,
+            `${home}/.npm-global/bin`,
+            `${home}/.local/bin`,
+        ]
+        : process.platform === "win32"
+            ? [
+                `${process.env.LOCALAPPDATA ?? ""}\\pnpm`,
+                `${process.env.APPDATA ?? ""}\\npm`,
+            ]
+            : [
+                `${home}/.local/share/pnpm`,
+                `${home}/.npm-global/bin`,
+                `${home}/.local/bin`,
+            ];
+    prependExistingBinDirs(candidates.filter(Boolean));
+}
+async function refreshProcessPathFromLoginShell() {
+    if (process.platform === "win32") {
+        return;
+    }
+    const shell = process.env.SHELL && process.env.SHELL.trim().length > 0 ? process.env.SHELL : "/bin/zsh";
+    const refreshed = await (0, exec_1.runCommand)(shell, ["-lc", "printf '%s' \"$PATH\""]);
+    if (refreshed.code === 0 && refreshed.stdout.trim()) {
+        process.env.PATH = refreshed.stdout.trim();
+    }
 }
 async function ensurePnpmGlobalBinConfigured(log) {
     const env = (0, githubTarballs_1.withMirrorRegistry)();
@@ -390,10 +524,11 @@ async function runAction(action, payload) {
         }
         return builtInOk || npmRemoved.code === 0 || !stillInstalledByNpm;
     };
-    const startDetached = async (cmd, args) => {
+    const startDetached = async (cmd, args, cwd) => {
         return await new Promise((resolve) => {
             try {
                 const child = (0, node_child_process_1.spawn)(cmd, args, {
+                    cwd,
                     detached: true,
                     stdio: "ignore",
                 });
@@ -417,6 +552,159 @@ async function runAction(action, payload) {
                 resolve({ ok: false, error: String(error) });
             }
         });
+    };
+    /** Detached spawn with ~2.8s grace: fail if process exits early or is gone (captures stdout/stderr tail). */
+    const startAutomationDetached = async (cmd, args, cwd, env = process.env) => {
+        const logPath = (0, node_path_1.join)((0, node_os_1.tmpdir)(), `clawwrapper-automation-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.log`);
+        let logFd;
+        try {
+            logFd = (0, node_fs_1.openSync)(logPath, "a");
+        }
+        catch (error) {
+            return { ok: false, error: String(error) };
+        }
+        const readLogTail = () => {
+            try {
+                const raw = (0, node_fs_1.readFileSync)(logPath, "utf8").trimEnd();
+                if (!raw) {
+                    return "";
+                }
+                const lines = raw.split("\n");
+                return lines.slice(-20).join("\n");
+            }
+            catch {
+                return "";
+            }
+        };
+        let logFdClosed = false;
+        const closeLogFdOnce = () => {
+            if (logFdClosed) {
+                return;
+            }
+            logFdClosed = true;
+            try {
+                (0, node_fs_1.closeSync)(logFd);
+            }
+            catch {
+                // ignore
+            }
+        };
+        const unlinkLogFile = () => {
+            try {
+                (0, node_fs_1.unlinkSync)(logPath);
+            }
+            catch {
+                // ignore (e.g. Windows lock)
+            }
+        };
+        const endLogSession = (keepLogFile) => {
+            closeLogFdOnce();
+            if (!keepLogFile) {
+                unlinkLogFile();
+            }
+        };
+        return await new Promise((resolve) => {
+            let settled = false;
+            const finish = (result) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                endLogSession(!result.ok);
+                resolve(result);
+            };
+            let child;
+            try {
+                child = (0, node_child_process_1.spawn)(cmd, args, {
+                    cwd,
+                    env,
+                    detached: true,
+                    stdio: ["ignore", logFd, logFd],
+                });
+            }
+            catch (error) {
+                endLogSession(true);
+                resolve({ ok: false, error: String(error) + `\n(log file: ${logPath})` });
+                return;
+            }
+            const graceMs = 2800;
+            let exitTimer;
+            const failWithTail = (headline) => {
+                const tail = readLogTail();
+                finish({
+                    ok: false,
+                    error: tail ? `${headline}\n---\n${tail}\n(log file: ${logPath})` : `${headline}\n(log file: ${logPath})`,
+                });
+            };
+            child.once("error", (error) => {
+                if (exitTimer !== undefined) {
+                    clearTimeout(exitTimer);
+                }
+                finish({ ok: false, error: String(error) + `\n(log file: ${logPath})` });
+            });
+            child.once("spawn", () => {
+                closeLogFdOnce();
+                child.unref();
+            });
+            child.once("exit", (code, signal) => {
+                if (exitTimer !== undefined) {
+                    clearTimeout(exitTimer);
+                }
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                const tail = readLogTail();
+                endLogSession(true);
+                const detail = code === 0 && !signal
+                    ? "自动化进程在启动阶段已退出 (code=0)。若未看到 Playwright Chromium 窗口，请检查是否已执行 playwright install chromium。"
+                    : `进程退出 (code=${code ?? "?"}, signal=${signal ?? "none"})。`;
+                resolve({
+                    ok: false,
+                    error: tail ? `${detail}\n---\n${tail}\n(log file: ${logPath})` : `${detail}\n(log file: ${logPath})`,
+                });
+            });
+            exitTimer = setTimeout(() => {
+                if (settled) {
+                    return;
+                }
+                const pid = child.pid;
+                if (pid === undefined) {
+                    failWithTail("无法获取子进程 PID。");
+                    return;
+                }
+                try {
+                    process.kill(pid, 0);
+                    finish({ ok: true });
+                }
+                catch {
+                    failWithTail("子进程在启动宽限期内已退出（可能缺少依赖或脚本报错）。");
+                }
+            }, graceMs);
+        });
+    };
+    const installPlaywrightChromiumForProject = async (projectRoot, pnpmCmd, npxCmd, hasPnpm, hasNpx, env) => {
+        const pnpmInstall = ["exec", "playwright", "install", "chromium"];
+        const npxInstall = ["playwright", "install", "chromium"];
+        const summarize = (r) => [r.stderr, r.stdout].map((s) => s.trim()).filter(Boolean).join("\n");
+        const first = hasPnpm
+            ? await (0, exec_1.runCommand)(pnpmCmd, pnpmInstall, { cwd: projectRoot, env })
+            : await (0, exec_1.runCommand)(npxCmd, npxInstall, { cwd: projectRoot, env });
+        if (first.code === 0) {
+            return { ok: true, detail: "" };
+        }
+        const firstLog = summarize(first);
+        if (hasPnpm && hasNpx) {
+            const second = await (0, exec_1.runCommand)(npxCmd, npxInstall, { cwd: projectRoot, env });
+            if (second.code === 0) {
+                return { ok: true, detail: "" };
+            }
+            return {
+                ok: false,
+                detail: [summarize(second), firstLog].filter(Boolean).join("\n---\n"),
+            };
+        }
+        return { ok: false, detail: firstLog || "playwright install chromium failed" };
     };
     if (["runGateway", "restartGateway", "openDashboard"].includes(action)) {
         const runtime = await detectRuntimeState();
@@ -467,26 +755,46 @@ async function runAction(action, payload) {
             debugLog("action-finish", { action, ok: response.ok });
             return response;
         }
-        case "update": {
-            const ok = await exec("Update OpenClaw", "npm", [
-                "install",
-                "-g",
-                "openclaw@latest",
-                "--verbose",
-                "--progress=true",
-            ]);
-            const response = { ok, title: ok ? "Update completed" : "Update failed", logs: logs.join("\n") };
-            debugLog("action-finish", { action, ok: response.ok });
-            return response;
-        }
+        case "update":
         case "fix": {
-            const doctorOk = await exec("Health check", "openclaw", ["doctor"]);
-            const statusOk = await exec("Status check", "openclaw", ["status"]);
-            const response = {
-                ok: doctorOk && statusOk,
-                title: doctorOk && statusOk ? "Fix checks completed" : "Fix checks found issues",
-                logs: logs.join("\n"),
+            if (maintenanceJob.running) {
+                const response = {
+                    ok: false,
+                    title: "维护任务进行中",
+                    logs: "已有升级/检查任务在运行，请稍候。",
+                };
+                debugLog("action-finish", { action, ok: response.ok, reason: "maintenance-busy" });
+                return response;
+            }
+            const kind = action;
+            const syncJob = {
+                running: false,
+                completed: true,
+                ok: false,
+                kind,
+                progress: 0,
+                title: "",
+                logs: [],
+                currentStep: "",
+                currentCommand: "",
+                currentPid: null,
+                stepStartedAt: null,
+                lastActivityAt: null,
+                lastExitCode: null,
+                lastExitSignal: null,
+                lastFailureReason: "",
             };
+            const appendSync = (line) => {
+                const normalized = line.trim();
+                if (!normalized) {
+                    return;
+                }
+                syncJob.logs.push(normalized);
+                if (syncJob.logs.length > 500) {
+                    syncJob.logs = syncJob.logs.slice(-500);
+                }
+            };
+            const response = await runMaintenancePipelineOnJob(syncJob, kind, appendSync);
             debugLog("action-finish", { action, ok: response.ok });
             return response;
         }
@@ -503,41 +811,28 @@ async function runAction(action, payload) {
             return response;
         }
         case "feishuSetup": {
+            const projectRoot = await resolveProjectRoot();
             const botName = (payload.botName ?? "").trim() || "OpenClaw 助手";
             const outputPath = (0, node_path_1.join)(process.env.HOME ?? ".", ".openclaw", "feishu-setup-result.json");
-            const feishuUrl = "https://open.feishu.cn/app";
             const pnpmCmd = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
             const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
-            // Always try to open one visible browser tab first.
-            const openedTab = process.platform === "darwin"
-                ? await startDetached("open", [feishuUrl])
-                : process.platform === "win32"
-                    ? await startDetached("cmd", ["/c", "start", "", feishuUrl])
-                    : await startDetached("xdg-open", [feishuUrl]);
             const hasPnpm = await (0, platform_1.commandExists)("pnpm");
             const hasNpx = await (0, platform_1.commandExists)("npx");
             if (!hasPnpm && !hasNpx) {
-                const response = openedTab.ok
-                    ? {
-                        ok: true,
-                        title: "Feishu 页面已打开（手动模式）",
-                        logs: "已打开飞书页面，但未检测到 pnpm/npx，无法启动自动化。\n" +
-                            "请先扫码登录后手动完成创建应用与权限配置。",
-                    }
-                    : {
-                        ok: false,
-                        title: "Feishu 配置启动失败",
-                        logs: "未检测到 pnpm/npx，且无法自动打开浏览器。\n" +
-                            `浏览器错误: ${openedTab.error ?? "unknown error"}`,
-                    };
+                const response = {
+                    ok: false,
+                    title: "Feishu 配置启动失败",
+                    logs: "未检测到 pnpm/npx，无法启动 Playwright 自动化浏览器。",
+                };
                 debugLog("action-finish", { action, ok: response.ok });
                 return response;
             }
+            const pwEnv = (0, githubTarballs_1.withPlaywrightAutomationEnv)(process.env);
             const pnpmPlaywrightCheck = hasPnpm
-                ? await (0, exec_1.runCommand)(pnpmCmd, ["exec", "playwright", "--version"])
+                ? await (0, exec_1.runCommand)(pnpmCmd, ["exec", "playwright", "--version"], { cwd: projectRoot, env: pwEnv })
                 : { code: 1, stdout: "", stderr: "" };
             const npxPlaywrightCheck = hasNpx
-                ? await (0, exec_1.runCommand)(npxCmd, ["playwright", "--version"])
+                ? await (0, exec_1.runCommand)(npxCmd, ["playwright", "--version"], { cwd: projectRoot, env: pwEnv })
                 : { code: 1, stdout: "", stderr: "" };
             const playwrightReady = pnpmPlaywrightCheck.code === 0 || npxPlaywrightCheck.code === 0;
             if (!playwrightReady) {
@@ -547,20 +842,22 @@ async function runAction(action, payload) {
                 ]
                     .filter(Boolean)
                     .join("\n");
-                const response = openedTab.ok
-                    ? {
-                        ok: true,
-                        title: "Feishu 页面已打开（手动模式）",
-                        logs: "已打开飞书页面，但 Playwright 不可用，自动化未启动。\n" +
-                            (checkErr || "Playwright check failed."),
-                    }
-                    : {
-                        ok: false,
-                        title: "Feishu 配置启动失败",
-                        logs: "Playwright 不可用，且无法自动打开浏览器。\n" +
-                            `浏览器错误: ${openedTab.error ?? "unknown error"}\n` +
-                            (checkErr || ""),
-                    };
+                const response = {
+                    ok: false,
+                    title: "Feishu 配置启动失败",
+                    logs: "Playwright 不可用，自动化浏览器未启动。\n" + (checkErr || "Playwright check failed."),
+                };
+                debugLog("action-finish", { action, ok: response.ok });
+                return response;
+            }
+            const chromiumInstall = await installPlaywrightChromiumForProject(projectRoot, pnpmCmd, npxCmd, hasPnpm, hasNpx, pwEnv);
+            if (!chromiumInstall.ok) {
+                const response = {
+                    ok: false,
+                    title: "Feishu 配置启动失败",
+                    logs: "安装 Playwright Chromium 失败。默认使用 Playwright 官方多 CDN；若需国内镜像可设置 CLAW_WRAPPER_PLAYWRIGHT_DOWNLOAD_HOST，或 CLAW_WRAPPER_PLAYWRIGHT_USE_NPPMIRROR=1（镜像可能滞后导致 404）。\n" +
+                        chromiumInstall.detail,
+                };
                 debugLog("action-finish", { action, ok: response.ok });
                 return response;
             }
@@ -585,85 +882,62 @@ async function runAction(action, payload) {
                 "--headless",
                 "false",
             ];
-            const started = hasPnpm ? await startDetached(pnpmCmd, pnpmArgs) : await startDetached(npxCmd, npxArgs);
+            const started = hasPnpm
+                ? await startAutomationDetached(pnpmCmd, pnpmArgs, projectRoot, pwEnv)
+                : await startAutomationDetached(npxCmd, npxArgs, projectRoot, pwEnv);
             if (!started.ok && hasPnpm && hasNpx) {
-                const retry = await startDetached(npxCmd, npxArgs);
+                const retry = await startAutomationDetached(npxCmd, npxArgs, projectRoot, pwEnv);
                 if (!retry.ok) {
-                    const response = openedTab.ok
-                        ? {
-                            ok: true,
-                            title: "Feishu 页面已打开（手动模式）",
-                            logs: "飞书页面已打开，但自动化启动失败。\n" +
-                                ([started.error, retry.error].filter(Boolean).join("\n") || "无法启动 Feishu 自动化流程。"),
-                        }
-                        : {
-                            ok: false,
-                            title: "Feishu 配置启动失败",
-                            logs: ([started.error, retry.error].filter(Boolean).join("\n") || "无法启动 Feishu 自动化流程。") +
-                                `\n浏览器错误: ${openedTab.error ?? "unknown error"}`,
-                        };
+                    const response = {
+                        ok: false,
+                        title: "Feishu 配置启动失败",
+                        logs: [started.error, retry.error].filter(Boolean).join("\n") || "无法启动 Feishu 自动化流程。",
+                    };
                     debugLog("action-finish", { action, ok: response.ok });
                     return response;
                 }
             }
             else if (!started.ok) {
-                const response = openedTab.ok
-                    ? {
-                        ok: true,
-                        title: "Feishu 页面已打开（手动模式）",
-                        logs: "飞书页面已打开，但自动化启动失败。\n" + (started.error ?? "无法启动 Feishu 自动化流程。"),
-                    }
-                    : {
-                        ok: false,
-                        title: "Feishu 配置启动失败",
-                        logs: (started.error ?? "无法启动 Feishu 自动化流程。") + `\n浏览器错误: ${openedTab.error ?? "unknown error"}`,
-                    };
+                const response = {
+                    ok: false,
+                    title: "Feishu 配置启动失败",
+                    logs: started.error ?? "无法启动 Feishu 自动化流程。",
+                };
                 debugLog("action-finish", { action, ok: response.ok });
                 return response;
             }
             const response = {
                 ok: true,
                 title: "Feishu 自动化流程已启动",
-                logs: `已打开飞书页面并启动单 Tab 自动化流程（botName=${botName}）。\n` +
-                    "请在弹出的飞书页面扫码登录，登录后脚本会自动尝试：创建应用、权限批量导入、机器人能力配置。\n" +
+                logs: `已启动独立 Playwright Chromium 窗口（飞书专用临时配置目录，与 OneThing 互不共享）。botName=${botName}\n` +
+                    "请在弹出的 Chromium 窗口中完成飞书登录；登录后脚本会尝试创建应用、权限导入与机器人能力配置。\n" +
                     `结果文件: ${outputPath}`,
             };
             debugLog("action-finish", { action, ok: response.ok, botName });
             return response;
         }
         case "oneThingSetup": {
+            const projectRoot = await resolveProjectRoot();
             const outputPath = (0, node_path_1.join)(process.env.HOME ?? ".", ".openclaw", "onething-setup-result.json");
-            const oneThingUrl = "https://onethingai.com/";
             const pnpmCmd = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
             const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
-            const openedTab = process.platform === "darwin"
-                ? await startDetached("open", [oneThingUrl])
-                : process.platform === "win32"
-                    ? await startDetached("cmd", ["/c", "start", "", oneThingUrl])
-                    : await startDetached("xdg-open", [oneThingUrl]);
             const hasPnpm = await (0, platform_1.commandExists)("pnpm");
             const hasNpx = await (0, platform_1.commandExists)("npx");
             if (!hasPnpm && !hasNpx) {
-                const response = openedTab.ok
-                    ? {
-                        ok: true,
-                        title: "OneThingAI 页面已打开（手动模式）",
-                        logs: "已打开 OneThingAI 页面，但未检测到 pnpm/npx，无法启动自动化。",
-                    }
-                    : {
-                        ok: false,
-                        title: "OneThingAI 引导启动失败",
-                        logs: "未检测到 pnpm/npx，且无法自动打开浏览器。\n" +
-                            `浏览器错误: ${openedTab.error ?? "unknown error"}`,
-                    };
+                const response = {
+                    ok: false,
+                    title: "OneThingAI 引导启动失败",
+                    logs: "未检测到 pnpm/npx，无法启动 Playwright 自动化浏览器。",
+                };
                 debugLog("action-finish", { action, ok: response.ok });
                 return response;
             }
+            const pwEnv = (0, githubTarballs_1.withPlaywrightAutomationEnv)(process.env);
             const pnpmPlaywrightCheck = hasPnpm
-                ? await (0, exec_1.runCommand)(pnpmCmd, ["exec", "playwright", "--version"])
+                ? await (0, exec_1.runCommand)(pnpmCmd, ["exec", "playwright", "--version"], { cwd: projectRoot, env: pwEnv })
                 : { code: 1, stdout: "", stderr: "" };
             const npxPlaywrightCheck = hasNpx
-                ? await (0, exec_1.runCommand)(npxCmd, ["playwright", "--version"])
+                ? await (0, exec_1.runCommand)(npxCmd, ["playwright", "--version"], { cwd: projectRoot, env: pwEnv })
                 : { code: 1, stdout: "", stderr: "" };
             const playwrightReady = pnpmPlaywrightCheck.code === 0 || npxPlaywrightCheck.code === 0;
             if (!playwrightReady) {
@@ -673,20 +947,22 @@ async function runAction(action, payload) {
                 ]
                     .filter(Boolean)
                     .join("\n");
-                const response = openedTab.ok
-                    ? {
-                        ok: true,
-                        title: "OneThingAI 页面已打开（手动模式）",
-                        logs: "已打开 OneThingAI 页面，但 Playwright 不可用，自动化未启动。\n" +
-                            (checkErr || "Playwright check failed."),
-                    }
-                    : {
-                        ok: false,
-                        title: "OneThingAI 引导启动失败",
-                        logs: "Playwright 不可用，且无法自动打开浏览器。\n" +
-                            `浏览器错误: ${openedTab.error ?? "unknown error"}\n` +
-                            (checkErr || ""),
-                    };
+                const response = {
+                    ok: false,
+                    title: "OneThingAI 引导启动失败",
+                    logs: "Playwright 不可用，自动化浏览器未启动。\n" + (checkErr || "Playwright check failed."),
+                };
+                debugLog("action-finish", { action, ok: response.ok });
+                return response;
+            }
+            const chromiumInstall = await installPlaywrightChromiumForProject(projectRoot, pnpmCmd, npxCmd, hasPnpm, hasNpx, pwEnv);
+            if (!chromiumInstall.ok) {
+                const response = {
+                    ok: false,
+                    title: "OneThingAI 引导启动失败",
+                    logs: "安装 Playwright Chromium 失败。默认使用 Playwright 官方多 CDN；若需国内镜像可设置 CLAW_WRAPPER_PLAYWRIGHT_DOWNLOAD_HOST，或 CLAW_WRAPPER_PLAYWRIGHT_USE_NPPMIRROR=1（镜像可能滞后导致 404）。\n" +
+                        chromiumInstall.detail,
+                };
                 debugLog("action-finish", { action, ok: response.ok });
                 return response;
             }
@@ -707,46 +983,34 @@ async function runAction(action, payload) {
                 "--headless",
                 "false",
             ];
-            const started = hasPnpm ? await startDetached(pnpmCmd, pnpmArgs) : await startDetached(npxCmd, npxArgs);
+            const started = hasPnpm
+                ? await startAutomationDetached(pnpmCmd, pnpmArgs, projectRoot, pwEnv)
+                : await startAutomationDetached(npxCmd, npxArgs, projectRoot, pwEnv);
             if (!started.ok && hasPnpm && hasNpx) {
-                const retry = await startDetached(npxCmd, npxArgs);
+                const retry = await startAutomationDetached(npxCmd, npxArgs, projectRoot, pwEnv);
                 if (!retry.ok) {
-                    const response = openedTab.ok
-                        ? {
-                            ok: true,
-                            title: "OneThingAI 页面已打开（手动模式）",
-                            logs: "OneThingAI 页面已打开，但自动化启动失败。\n" +
-                                ([started.error, retry.error].filter(Boolean).join("\n") || "无法启动 OneThingAI 自动化流程。"),
-                        }
-                        : {
-                            ok: false,
-                            title: "OneThingAI 引导启动失败",
-                            logs: ([started.error, retry.error].filter(Boolean).join("\n") || "无法启动 OneThingAI 自动化流程。") +
-                                `\n浏览器错误: ${openedTab.error ?? "unknown error"}`,
-                        };
+                    const response = {
+                        ok: false,
+                        title: "OneThingAI 引导启动失败",
+                        logs: [started.error, retry.error].filter(Boolean).join("\n") || "无法启动 OneThingAI 自动化流程。",
+                    };
                     debugLog("action-finish", { action, ok: response.ok });
                     return response;
                 }
             }
             else if (!started.ok) {
-                const response = openedTab.ok
-                    ? {
-                        ok: true,
-                        title: "OneThingAI 页面已打开（手动模式）",
-                        logs: "OneThingAI 页面已打开，但自动化启动失败。\n" + (started.error ?? "无法启动 OneThingAI 自动化流程。"),
-                    }
-                    : {
-                        ok: false,
-                        title: "OneThingAI 引导启动失败",
-                        logs: (started.error ?? "无法启动 OneThingAI 自动化流程。") + `\n浏览器错误: ${openedTab.error ?? "unknown error"}`,
-                    };
+                const response = {
+                    ok: false,
+                    title: "OneThingAI 引导启动失败",
+                    logs: started.error ?? "无法启动 OneThingAI 自动化流程。",
+                };
                 debugLog("action-finish", { action, ok: response.ok });
                 return response;
             }
             const response = {
                 ok: true,
                 title: "OneThingAI 引导已启动",
-                logs: "已打开 OneThingAI 页面并启动单 Tab 引导流程：注册/登录后自动尝试进入 API Keys 并创建 Key。\n" +
+                logs: "已启动独立 Playwright Chromium 窗口（OneThing 专用临时配置目录，与飞书互不共享）。注册/登录后将尝试进入 API Keys 并创建 Key。\n" +
                     `结果文件: ${outputPath}`,
             };
             debugLog("action-finish", { action, ok: response.ok });
@@ -822,20 +1086,76 @@ async function isOpenClawNpmInstalled() {
     debugLog("detect-state: npm list did not find openclaw in any global prefix");
     return false;
 }
+async function getOpenClawBinaryCandidates() {
+    const home = process.env.HOME ?? "";
+    const candidates = new Set();
+    const names = process.platform === "win32"
+        ? ["openclaw.cmd", "openclaw.exe", "openclaw.bat"]
+        : ["openclaw"];
+    const addDir = (dir) => {
+        if (!dir) {
+            return;
+        }
+        for (const name of names) {
+            candidates.add(`${dir}${process.platform === "win32" ? "\\" : "/"}${name}`);
+        }
+    };
+    if (process.platform === "darwin") {
+        addDir(`${home}/Library/pnpm`);
+        addDir(`${home}/.npm-global/bin`);
+        addDir(`${home}/.local/bin`);
+    }
+    else if (process.platform === "win32") {
+        addDir(`${process.env.LOCALAPPDATA ?? ""}\\pnpm`);
+        addDir(`${process.env.APPDATA ?? ""}\\npm`);
+    }
+    else {
+        addDir(`${home}/.local/share/pnpm`);
+        addDir(`${home}/.npm-global/bin`);
+        addDir(`${home}/.local/bin`);
+    }
+    if (await (0, platform_1.commandExists)("npm")) {
+        const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+        const prefix = await (0, exec_1.runCommand)(npmCmd, ["config", "get", "prefix"]);
+        const dir = prefix.stdout.trim();
+        if (dir) {
+            addDir(process.platform === "win32" ? dir : `${dir}/bin`);
+        }
+    }
+    return Array.from(candidates);
+}
+async function resolveOpenClawCommand() {
+    addCommonUserBinDirsToPath();
+    if (await (0, platform_1.commandExists)("openclaw")) {
+        return "openclaw";
+    }
+    await refreshProcessPathFromLoginShell();
+    addCommonUserBinDirsToPath();
+    if (await (0, platform_1.commandExists)("openclaw")) {
+        return "openclaw";
+    }
+    for (const candidate of await getOpenClawBinaryCandidates()) {
+        if (await (0, source_1.pathExists)(candidate)) {
+            return candidate;
+        }
+    }
+    return null;
+}
 async function isOpenClawBinaryUsable() {
-    const foundInPath = await (0, platform_1.commandExists)("openclaw");
-    if (!foundInPath) {
+    const openclawCmd = await resolveOpenClawCommand();
+    if (!openclawCmd) {
         return false;
     }
-    // Verify the binary actually works (not a broken stub)
-    const versionProbe = await (0, exec_1.runCommand)("openclaw", ["--version"]);
-    return isHealthyOpenClawProbe(versionProbe);
+    process.env.OPENCLAW_RESOLVED_CMD = openclawCmd;
+    const probe = await (0, exec_1.runCommand)(openclawCmd, ["--version"]);
+    return isHealthyOpenClawProbe(probe);
 }
 async function isDaemonReady(binaryUsable) {
     if (!binaryUsable) {
         return false;
     }
-    const status = await (0, exec_1.runCommand)("openclaw", ["status"]);
+    const openclawCmd = process.env.OPENCLAW_RESOLVED_CMD || "openclaw";
+    const status = await (0, exec_1.runCommand)(openclawCmd, ["status"]);
     const text = `${status.stdout}\n${status.stderr}`.toLowerCase();
     if (status.code !== 0) {
         return false;
@@ -908,6 +1228,16 @@ function appendInstallLog(text) {
         installJob.logs = installJob.logs.slice(-500);
     }
 }
+function appendMaintenanceLog(text) {
+    const normalized = text.trim();
+    if (!normalized) {
+        return;
+    }
+    maintenanceJob.logs.push(normalized);
+    if (maintenanceJob.logs.length > 500) {
+        maintenanceJob.logs = maintenanceJob.logs.slice(-500);
+    }
+}
 function tailText(text, maxLines = 160, maxChars = 10000) {
     if (!text.trim()) {
         return "";
@@ -930,23 +1260,26 @@ function extractNpmDebugLogPath(text) {
     }
     return null;
 }
-async function appendNpmDebugLogTail(output) {
+async function appendNpmDebugLogTailToAppender(output, appendLog) {
     const debugLogPath = extractNpmDebugLogPath(output);
     if (!debugLogPath) {
         return;
     }
-    appendInstallLog(`检测到 npm debug 日志: ${debugLogPath}`);
+    appendLog(`检测到 npm debug 日志: ${debugLogPath}`);
     try {
         const content = await (0, promises_1.readFile)(debugLogPath, "utf8");
         const snippet = tailText(content, 140, 9000);
         if (snippet) {
-            appendInstallLog("npm debug log tail:");
-            appendInstallLog(snippet);
+            appendLog("npm debug log tail:");
+            appendLog(snippet);
         }
     }
     catch (error) {
-        appendInstallLog(`读取 npm debug 日志失败: ${String(error)}`);
+        appendLog(`读取 npm debug 日志失败: ${String(error)}`);
     }
+}
+async function appendNpmDebugLogTail(output) {
+    await appendNpmDebugLogTailToAppender(output, appendInstallLog);
 }
 function parsePercentFromOutput(text) {
     const matches = [...text.matchAll(/(\d{1,3})%/g)];
@@ -1155,6 +1488,254 @@ async function runInstallStep(cmd, args, options = {}) {
         });
     });
 }
+async function runMaintenanceStep(cmd, args, job, appendLog, options = {}) {
+    return await new Promise((resolve) => {
+        const commandText = `${cmd} ${args.join(" ")}`.trim();
+        const stepName = options.stepName ?? commandText;
+        const isPackageInstallStep = /\b(npm|pnpm)\s+install\b/i.test(stepName);
+        const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
+        const useSyntheticProgress = options.useSyntheticProgress ?? false;
+        debugLog("maintenance-step-start", { cmd, args, stepName, timeoutMs, useSyntheticProgress });
+        appendLog(`$ ${commandText}`);
+        job.currentStep = stepName;
+        job.currentCommand = commandText;
+        job.stepStartedAt = Date.now();
+        job.lastActivityAt = Date.now();
+        job.title = `正在执行: ${commandText}`;
+        let child;
+        try {
+            child = (0, node_child_process_1.spawn)(cmd, args, {
+                shell: false,
+                detached: process.platform !== "win32",
+                env: options.env ?? process.env,
+                cwd: options.cwd ?? process.cwd(),
+            });
+        }
+        catch (error) {
+            const reason = `启动失败: ${String(error)}`;
+            appendLog(reason);
+            job.lastFailureReason = reason;
+            job.currentPid = null;
+            job.lastExitCode = null;
+            job.lastExitSignal = null;
+            debugLog("maintenance-step-spawn-throw", { cmd, args, error: String(error) });
+            resolve(false);
+            return;
+        }
+        job.currentPid = child.pid ?? null;
+        job.lastFailureReason = "";
+        let stderrBuffer = "";
+        let stdoutBuffer = "";
+        let settled = false;
+        const stepStartedAt = Date.now();
+        let lastActivityAt = Date.now();
+        const inactivityTimeoutMs = options.inactivityTimeoutMs ?? 0;
+        const finish = (ok) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearInterval(progressTicker);
+            clearTimeout(stepTimeout);
+            resolve(ok);
+        };
+        const onChunk = (chunk, source) => {
+            const text = chunk.toString();
+            const parsed = parsePercentFromOutput(text);
+            if (parsed !== null) {
+                job.progress = Math.max(job.progress, parsed);
+            }
+            else if (isPackageInstallStep) {
+                const inferred = parseNpmProgressFromOutput(text);
+                if (inferred !== null) {
+                    job.progress = Math.max(job.progress, inferred);
+                }
+            }
+            if (text.trim()) {
+                lastActivityAt = Date.now();
+                job.lastActivityAt = lastActivityAt;
+            }
+            if (source === "stdout") {
+                stdoutBuffer += text;
+            }
+            else {
+                stderrBuffer += text;
+            }
+            const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+            for (const line of lines) {
+                appendLog(line);
+            }
+        };
+        const progressTicker = setInterval(() => {
+            if (inactivityTimeoutMs > 0 && Date.now() - lastActivityAt > inactivityTimeoutMs) {
+                const elapsedSec = Math.floor((Date.now() - stepStartedAt) / 1000);
+                const idleSec = Math.floor((Date.now() - lastActivityAt) / 1000);
+                const reason = `步骤无输出超时(${idleSec}s): ${commandText} (pid=${child.pid ?? "unknown"}, elapsed=${elapsedSec}s)`;
+                appendLog(reason);
+                job.lastFailureReason = reason;
+                debugLog("maintenance-step-inactivity-timeout", {
+                    cmd,
+                    args,
+                    pid: child.pid ?? 0,
+                    elapsedSec,
+                    idleSec,
+                });
+                try {
+                    if (process.platform === "win32" && child.pid) {
+                        void (0, exec_1.runCommand)("taskkill", ["/PID", String(child.pid), "/T", "/F"]);
+                    }
+                    else if (child.pid) {
+                        process.kill(-child.pid, "SIGTERM");
+                    }
+                }
+                catch {
+                    // ignore
+                }
+                finish(false);
+                return;
+            }
+            if (useSyntheticProgress && job.progress < 99) {
+                job.progress = Math.max(job.progress, job.progress + 1);
+            }
+        }, 2000);
+        const stepTimeout = setTimeout(() => {
+            const reason = `步骤超时: ${commandText}`;
+            appendLog(reason);
+            job.lastFailureReason = reason;
+            debugLog("maintenance-step-timeout", { cmd, args });
+            try {
+                if (process.platform === "win32") {
+                    void (0, exec_1.runCommand)("taskkill", ["/PID", String(child.pid), "/T", "/F"]);
+                }
+                else if (child.pid) {
+                    process.kill(-child.pid, "SIGTERM");
+                }
+            }
+            catch {
+                // ignore
+            }
+            finish(false);
+        }, timeoutMs);
+        child.stdout?.on("data", (chunk) => onChunk(chunk, "stdout"));
+        child.stderr?.on("data", (chunk) => onChunk(chunk, "stderr"));
+        child.on("error", (error) => {
+            const reason = `启动失败: ${String(error)}`;
+            appendLog(reason);
+            job.lastFailureReason = reason;
+            debugLog("maintenance-step-error", { cmd, args, error: String(error) });
+            job.currentPid = null;
+            job.lastExitCode = null;
+            job.lastExitSignal = null;
+            finish(false);
+        });
+        child.on("close", async (code, signal) => {
+            debugLog("maintenance-step-close", { cmd, args, code, signal });
+            job.currentPid = null;
+            job.lastExitCode = code ?? null;
+            job.lastExitSignal = signal ?? null;
+            if (code !== 0) {
+                const reason = `命令失败: ${commandText} (exit=${code ?? "null"}, signal=${signal ?? "none"})`;
+                job.lastFailureReason = reason;
+                appendLog(reason);
+                const stderrTail = tailText(stderrBuffer);
+                const stdoutTail = tailText(stdoutBuffer);
+                if (stderrTail) {
+                    appendLog("stderr tail:");
+                    appendLog(stderrTail);
+                }
+                if (stdoutTail) {
+                    appendLog("stdout tail:");
+                    appendLog(stdoutTail);
+                }
+                if (!stderrTail && !stdoutTail) {
+                    appendLog("未捕获到结构化错误输出，已回退到原始命令失败提示。");
+                }
+                if (/(^|\s)(npm|npm\.cmd)(\s|$)/i.test(commandText)) {
+                    await appendNpmDebugLogTailToAppender(`${stdoutBuffer}\n${stderrBuffer}`, appendLog);
+                }
+            }
+            finish(code === 0);
+        });
+    });
+}
+async function runMaintenancePipelineOnJob(job, kind, appendLog) {
+    job.progress = Math.max(job.progress, 1);
+    job.lastFailureReason = "";
+    if (kind === "update") {
+        appendLog(`使用镜像源: ${githubTarballs_1.DEFAULT_NPM_REGISTRY}`);
+        const mirrorEnv = (0, githubTarballs_1.withMirrorRegistry)();
+        const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+        const ok = await runMaintenanceStep(npmCmd, ["install", "-g", "openclaw@latest", "--verbose", "--progress=true"], job, appendLog, { env: mirrorEnv, stepName: "npm install -g openclaw@latest", inactivityTimeoutMs: 10 * 60 * 1000 });
+        return { ok, title: ok ? "Update completed" : "Update failed", logs: job.logs.join("\n") };
+    }
+    const doctorOk = await runMaintenanceStep("openclaw", ["doctor"], job, appendLog, { stepName: "openclaw doctor" });
+    if (!doctorOk) {
+        return { ok: false, title: "Fix checks found issues", logs: job.logs.join("\n") };
+    }
+    const statusOk = await runMaintenanceStep("openclaw", ["status"], job, appendLog, { stepName: "openclaw status" });
+    const ok = statusOk;
+    return { ok, title: ok ? "Fix checks completed" : "Fix checks found issues", logs: job.logs.join("\n") };
+}
+function startMaintenanceJob(kind) {
+    if (installJob.running || uninstallJob.running || maintenanceJob.running) {
+        debugLog("maintenance-job-start-skip", {
+            installRunning: installJob.running,
+            uninstallRunning: uninstallJob.running,
+            maintenanceRunning: maintenanceJob.running,
+        });
+        return false;
+    }
+    maintenanceJob = {
+        running: true,
+        completed: false,
+        ok: false,
+        kind,
+        progress: 0,
+        title: kind === "update" ? "正在升级 OpenClaw" : "正在执行自动修复检查",
+        logs: [kind === "update" ? "开始升级 OpenClaw..." : "开始自动修复检查..."],
+        currentStep: "preflight",
+        currentCommand: "",
+        currentPid: null,
+        stepStartedAt: Date.now(),
+        lastActivityAt: Date.now(),
+        lastExitCode: null,
+        lastExitSignal: null,
+        lastFailureReason: "",
+    };
+    debugLog("maintenance-job-started", { kind });
+    void (async () => {
+        try {
+            const result = await runMaintenancePipelineOnJob(maintenanceJob, kind, appendMaintenanceLog);
+            maintenanceJob.ok = result.ok;
+            maintenanceJob.title = result.title;
+            maintenanceJob.completed = true;
+            maintenanceJob.running = false;
+            maintenanceJob.progress = result.ok ? 100 : Math.max(maintenanceJob.progress, 1);
+            maintenanceJob.currentStep = "completed";
+            maintenanceJob.currentPid = null;
+            if (result.ok) {
+                maintenanceJob.lastFailureReason = "";
+            }
+            else if (!maintenanceJob.lastFailureReason) {
+                maintenanceJob.lastFailureReason = result.title;
+            }
+            debugLog("maintenance-job-finished", { ok: result.ok, kind });
+        }
+        catch (error) {
+            maintenanceJob.running = false;
+            maintenanceJob.completed = true;
+            maintenanceJob.ok = false;
+            maintenanceJob.progress = 100;
+            maintenanceJob.title = "Maintenance failed";
+            maintenanceJob.currentStep = "failed";
+            maintenanceJob.currentPid = null;
+            maintenanceJob.lastFailureReason = String(error);
+            appendMaintenanceLog(`维护任务异常: ${String(error)}`);
+            debugLog("maintenance-job-error", { kind, error: String(error) });
+        }
+    })();
+    return true;
+}
 async function terminateInstallChild() {
     const child = installChild;
     if (!child?.pid) {
@@ -1199,6 +1780,10 @@ function startInstallJob() {
         debugLog("install-job-start-skip", { reason: "already-running" });
         return false;
     }
+    if (maintenanceJob.running) {
+        debugLog("install-job-start-skip", { reason: "maintenance-running" });
+        return false;
+    }
     installJob = {
         running: true,
         completed: false,
@@ -1218,22 +1803,24 @@ function startInstallJob() {
     };
     debugLog("install-job-started");
     const pnpmCmd = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
-    const sourceDir = source_1.LOCAL_OPENCLAW_SOURCE_ABSOLUTE;
+    let sourceDir = "";
     let activeSourceRef = source_1.OPENCLAW_PINNED_REF;
     let mirrorEnv = (0, githubTarballs_1.withMirrorRegistry)();
     void (async () => {
         appendInstallLog(`使用镜像源: ${githubTarballs_1.DEFAULT_NPM_REGISTRY}`);
-        const packageJsonPath = (0, node_path_1.join)(sourceDir, "package.json");
-        if (!(await (0, source_1.pathExists)(packageJsonPath))) {
+        const stableSource = await (0, source_1.ensureStableOpenClawSource)(appendInstallLog);
+        if (!stableSource.ok) {
             installJob.running = false;
             installJob.completed = true;
             installJob.ok = false;
             installJob.title = "安装失败（缺少本地源码）";
-            installJob.lastFailureReason = `未找到本地源码: ${source_1.LOCAL_OPENCLAW_SOURCE_RELATIVE}`;
-            appendInstallLog(`未找到本地源码目录 ${source_1.LOCAL_OPENCLAW_SOURCE_RELATIVE}。`);
+            installJob.lastFailureReason = stableSource.message ?? `未找到本地源码: ${source_1.LOCAL_OPENCLAW_SOURCE_RELATIVE}`;
+            appendInstallLog(stableSource.message ?? `未找到本地源码目录 ${source_1.LOCAL_OPENCLAW_SOURCE_RELATIVE}。`);
             appendInstallLog("请先将 OpenClaw 源码放到 vendor/openclaw，再点击安装。");
             return;
         }
+        sourceDir = stableSource.sourceDir;
+        appendInstallLog(`稳定安装目录: ${sourceDir}`);
         const sourcePrepared = await (0, source_1.preparePinnedOpenClawSource)(sourceDir, source_1.OPENCLAW_PINNED_REF, appendInstallLog);
         if (!sourcePrepared.ok) {
             installJob.running = false;
@@ -1385,8 +1972,12 @@ async function cancelInstallJob() {
     return true;
 }
 function startUninstallJob() {
-    if (uninstallJob.running || installJob.running) {
-        debugLog("uninstall-job-start-skip", { uninstallRunning: uninstallJob.running, installRunning: installJob.running });
+    if (uninstallJob.running || installJob.running || maintenanceJob.running) {
+        debugLog("uninstall-job-start-skip", {
+            uninstallRunning: uninstallJob.running,
+            installRunning: installJob.running,
+            maintenanceRunning: maintenanceJob.running,
+        });
         return false;
     }
     uninstallJob = {
@@ -1481,6 +2072,89 @@ function commonStyles() {
     #result { min-height: 20px; margin-top: 10px; font-weight: 600; }
     #logs, #chatLog { margin-top: 10px; min-height: 180px; white-space: pre-wrap; overflow-y: auto; border:1px solid #31447d; border-radius:8px; background:#0a1126; padding:10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
     .chatInput { display:grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .maintenance-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    .maintenance-modal.is-open { display: flex; }
+    .maintenance-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.62);
+      animation: maintenance-fade-in 0.2s ease;
+    }
+    .maintenance-modal-panel {
+      position: relative;
+      z-index: 1;
+      width: min(720px, 100%);
+      max-height: min(84vh, 640px);
+      display: flex;
+      flex-direction: column;
+      background: #101a35;
+      border: 1px solid #2c3c70;
+      border-radius: 12px;
+      padding: 16px 18px;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+      animation: maintenance-panel-in 0.25s ease;
+    }
+    .maintenance-modal-panel--compact {
+      max-height: min(40vh, 320px);
+      width: min(440px, 100%);
+    }
+    .maintenance-modal-logs--hidden {
+      display: none !important;
+    }
+    .maintenance-modal-panel h2 { margin: 0 0 8px; font-size: 18px; }
+    .maintenance-modal-status {
+      color: #9eb0df;
+      font-size: 13px;
+      margin-bottom: 8px;
+      white-space: pre-wrap;
+      min-height: 1.2em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .maintenance-modal-logs {
+      flex: 1;
+      min-height: 200px;
+      max-height: 42vh;
+      overflow: auto;
+      margin: 0;
+      padding: 10px;
+      background: #0a1126;
+      border: 1px solid #31447d;
+      border-radius: 8px;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .maintenance-modal-actions { margin-top: 12px; text-align: right; }
+    .maintenance-spinner {
+      display: none;
+      width: 14px;
+      height: 14px;
+      border: 2px solid #5a7cff;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: maintenance-spin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
+    .maintenance-spinner.is-visible { display: inline-block; }
+    @keyframes maintenance-spin { to { transform: rotate(360deg); } }
+    @keyframes maintenance-fade-in { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes maintenance-panel-in {
+      from { opacity: 0; transform: translateY(12px) scale(0.98); }
+      to { opacity: 1; transform: none; }
+    }
     @media (max-width: 920px) { .grid, .row, .chatInput { grid-template-columns: 1fr; } }
   `;
 }
@@ -1652,6 +2326,10 @@ function renderControlPage(configPath, config, state) {
     const installButtonHtml = state.openclawInstalled
         ? ""
         : `<button id="installBtn" data-action="install">安装 OpenClaw</button>`;
+    const configErrors = (0, config_1.validateConfig)(config);
+    const configErrorHtml = configErrors.length
+        ? configErrors.map((e) => `• ${escapeHtml(e)}`).join("<br/>")
+        : "";
     return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1685,7 +2363,7 @@ function renderControlPage(configPath, config, state) {
         <button class="secondary" data-action="openDashboard" ${requiresDaemonDisabled}>打开官方 Dashboard</button>
         <div id="installingTip" class="installing-tip">正在安装 OpenClaw，请稍候...</div>
         <div id="installMeta" class="install-meta"></div>
-        <div id="uninstallingTip" class="installing-tip" style="color:#ff95aa;">正在卸载 OpenClaw，请稍候...</div>
+        <div id="uninstallingTip" class="installing-tip" style="display:none;color:#ff95aa;" aria-hidden="true">正在卸载 OpenClaw，请稍候...</div>
         <p class="small">
           安装状态：<span id="installStateBadge" class="${state.openclawInstalled ? "badge-ok" : "badge-warn"}">${state.openclawInstalled ? "已安装（安装按钮已禁用）" : "未安装（可点击安装）"}</span>；
           Daemon：<span id="daemonStateBadge" class="${state.daemonReady ? "badge-ok" : "badge-warn"}">${state.daemonReady ? "已配置（可启动网关）" : "未配置（请先保存配置）"}</span>；
@@ -1768,6 +2446,11 @@ function renderControlPage(configPath, config, state) {
         </div>
       </div>
       <button id="saveControlBtn" ${requiresInstallDisabled}>保存配置</button>
+      ${configErrorHtml
+        ? `<p class="small" style="margin-top:10px;color:#ffd166;white-space:pre-wrap;" id="configMissingTip">
+               配置缺失项（点击保存会再次校验）：<br/>${configErrorHtml}
+             </p>`
+        : ""}
       <button class="secondary" id="feishuSetupBtn" ${requiresInstallDisabled}>配置飞书（Playwright）</button>
       <p id="result"></p>
       <div id="logs">Action logs appear here.</div>
@@ -1778,6 +2461,20 @@ function renderControlPage(configPath, config, state) {
       <p class="sub">点击进入 OneThingAI 注册或配置 API Key 流程。</p>
       <a class="btn" href="https://onethingai.com/" target="_blank" rel="noreferrer">前往 OneThingAI</a>
     </section>
+  </div>
+  <div id="maintenanceModal" class="maintenance-modal" aria-hidden="true">
+    <div class="maintenance-modal-backdrop" id="maintenanceModalBackdrop"></div>
+    <div id="maintenanceModalPanel" class="maintenance-modal-panel" role="dialog" aria-labelledby="maintenanceModalTitle">
+      <h2 id="maintenanceModalTitle">维护任务</h2>
+      <div id="maintenanceModalStatus" class="maintenance-modal-status">
+        <span id="maintenanceModalSpinner" class="maintenance-spinner"></span>
+        <span id="maintenanceModalStatusText"></span>
+      </div>
+      <pre id="maintenanceModalLogs" class="maintenance-modal-logs"></pre>
+      <div class="maintenance-modal-actions">
+        <button type="button" id="maintenanceModalClose" class="secondary">关闭</button>
+      </div>
+    </div>
   </div>
   <script>
     document.getElementById("dailyLimit").value = "${escapeHtml(config.models.dailyLimit)}";
@@ -1796,6 +2493,17 @@ function renderControlPage(configPath, config, state) {
     let uiInstalling = false;
     let uiUninstalling = false;
     let uninstallTick = null;
+    const maintenanceModal = document.getElementById("maintenanceModal");
+    const maintenanceModalPanel = document.getElementById("maintenanceModalPanel");
+    const maintenanceModalTitle = document.getElementById("maintenanceModalTitle");
+    const maintenanceModalStatusText = document.getElementById("maintenanceModalStatusText");
+    const maintenanceModalLogs = document.getElementById("maintenanceModalLogs");
+    const maintenanceModalClose = document.getElementById("maintenanceModalClose");
+    const maintenanceModalSpinner = document.getElementById("maintenanceModalSpinner");
+    const maintenanceModalBackdrop = document.getElementById("maintenanceModalBackdrop");
+    let taskModalPoll = null;
+    let taskModalContext = "idle";
+    let uiMaintenanceRunning = false;
     const setResult = (ok, msg) => {
       result.style.color = ok ? "#8ef0aa" : "#ff95aa";
       result.textContent = msg;
@@ -1839,10 +2547,12 @@ function renderControlPage(configPath, config, state) {
       const saveControlBtn = document.getElementById("saveControlBtn");
       const feishuSetupBtn = document.getElementById("feishuSetupBtn");
       const guideFeishuBtn = document.getElementById("guideFeishuBtn");
+      const guideModelBtn = document.getElementById("guideModelBtn");
       if (installSkillBtn) installSkillBtn.disabled = !runtimeOpenclawInstalled;
       if (saveControlBtn) saveControlBtn.disabled = !runtimeOpenclawInstalled;
-      if (feishuSetupBtn) feishuSetupBtn.disabled = !runtimeOpenclawInstalled;
-      if (guideFeishuBtn) guideFeishuBtn.disabled = !runtimeOpenclawInstalled;
+      if (feishuSetupBtn) feishuSetupBtn.disabled = false;
+      if (guideFeishuBtn) guideFeishuBtn.disabled = false;
+      if (guideModelBtn) guideModelBtn.disabled = false;
       if (installStateBadge) {
         installStateBadge.className = runtimeOpenclawInstalled ? "badge-ok" : "badge-warn";
         installStateBadge.textContent = runtimeOpenclawInstalled ? "已安装（安装按钮已禁用）" : "未安装（可点击安装）";
@@ -1863,11 +2573,111 @@ function renderControlPage(configPath, config, state) {
       }
     };
     applyActionButtonsState();
-    const showFailure = (msg, details = "") => {
+    const showFailure = (msg, details = "", silent = false) => {
       setResult(false, msg);
       if (details) setLogs(details);
-      window.alert(msg);
+      if (!silent) window.alert(msg);
     };
+    const reportTaskModalFailure = (title, details = "") => {
+      setResult(false, title || "失败");
+      if (details) setLogs(details);
+      if (maintenanceModalStatusText) maintenanceModalStatusText.textContent = title || "失败";
+      if (maintenanceModalLogs && details) maintenanceModalLogs.textContent = details;
+      setMaintenanceSpinner(false);
+    };
+    const setMaintenanceSpinner = (visible) => {
+      if (maintenanceModalSpinner) maintenanceModalSpinner.classList.toggle("is-visible", visible);
+    };
+    const clearTaskModalPoll = () => {
+      if (taskModalPoll) {
+        clearInterval(taskModalPoll);
+        taskModalPoll = null;
+      }
+    };
+    const openTaskModal = (title, options = {}) => {
+      clearTaskModalPoll();
+      const compact = Boolean(options.compact);
+      const showLogs = compact ? Boolean(options.showLogs) : options.showLogs !== false;
+      taskModalContext = typeof options.context === "string" ? options.context : "generic";
+      if (maintenanceModalTitle) maintenanceModalTitle.textContent = title;
+      if (maintenanceModalStatusText) maintenanceModalStatusText.textContent = compact ? "执行中…" : "正在启动…";
+      if (maintenanceModalLogs) {
+        maintenanceModalLogs.textContent = "";
+        maintenanceModalLogs.classList.toggle("maintenance-modal-logs--hidden", !showLogs);
+      }
+      if (maintenanceModalPanel) {
+        maintenanceModalPanel.classList.toggle("maintenance-modal-panel--compact", compact);
+      }
+      setMaintenanceSpinner(true);
+      if (maintenanceModal) {
+        maintenanceModal.classList.add("is-open");
+        maintenanceModal.setAttribute("aria-hidden", "false");
+      }
+      document.body.style.overflow = "hidden";
+    };
+    const closeTaskModal = () => {
+      clearTaskModalPoll();
+      taskModalContext = "idle";
+      setMaintenanceSpinner(false);
+      if (maintenanceModalPanel) {
+        maintenanceModalPanel.classList.remove("maintenance-modal-panel--compact");
+      }
+      if (maintenanceModalLogs) {
+        maintenanceModalLogs.classList.remove("maintenance-modal-logs--hidden");
+      }
+      if (maintenanceModal) {
+        maintenanceModal.classList.remove("is-open");
+        maintenanceModal.setAttribute("aria-hidden", "true");
+      }
+      document.body.style.overflow = "";
+    };
+    const refreshMaintenanceStatus = async () => {
+      const response = await fetch("/maintenance/status");
+      const data = await response.json();
+      if (maintenanceModalLogs) {
+        maintenanceModalLogs.textContent = (data.logs || []).join("\\n");
+        maintenanceModalLogs.scrollTop = maintenanceModalLogs.scrollHeight;
+      }
+      if (maintenanceModalStatusText) {
+        const pct = typeof data.progress === "number" ? data.progress : 0;
+        let line = (data.title || "") + (data.running ? " (" + pct + "%)" : "");
+        if (data.currentCommand) {
+          line = (line ? line + "\\n" : "") + "命令: " + data.currentCommand;
+        }
+        maintenanceModalStatusText.textContent = line || (data.running ? "进行中…" : "");
+      }
+      setMaintenanceSpinner(Boolean(data.running));
+      return data;
+    };
+    const syncUninstallToTaskModal = (data) => {
+      if (taskModalContext !== "uninstall") return;
+      if (maintenanceModalLogs) {
+        maintenanceModalLogs.textContent = (data.logs || []).join("\\n");
+        maintenanceModalLogs.scrollTop = maintenanceModalLogs.scrollHeight;
+      }
+      if (maintenanceModalStatusText) {
+        const pct = typeof data.progress === "number" ? data.progress : 0;
+        let line = (data.title || "") + (data.running ? " (" + pct + "%)" : "");
+        if (data.currentStep) {
+          line = (line ? line + "\\n" : "") + "步骤: " + data.currentStep;
+        }
+        if (data.lastFailureReason) {
+          line = (line ? line + "\\n" : "") + "失败原因: " + data.lastFailureReason;
+        }
+        maintenanceModalStatusText.textContent = line || (data.running ? "进行中…" : "");
+      }
+      setMaintenanceSpinner(Boolean(data.running));
+    };
+    if (maintenanceModalClose) {
+      maintenanceModalClose.addEventListener("click", () => {
+        if (!maintenanceModalClose.disabled) closeTaskModal();
+      });
+    }
+    if (maintenanceModalBackdrop) {
+      maintenanceModalBackdrop.addEventListener("click", () => {
+        if (maintenanceModalClose && !maintenanceModalClose.disabled) closeTaskModal();
+      });
+    }
     const formatDuration = (seconds) => {
       const n = Number(seconds);
       if (!Number.isFinite(n) || n < 0) return "-";
@@ -1942,27 +2752,22 @@ function renderControlPage(configPath, config, state) {
     };
 
     const setUninstalling = (running) => {
-      if (!uninstallingTip) return;
       if (running) {
         if (uiUninstalling) return;
         uiUninstalling = true;
         disableAllButtons(true);
-        let dots = 0;
-        uninstallingTip.style.display = "block";
-        const initial = Number.parseInt((uninstallingTip.dataset.progress || "0"), 10) || 0;
-        uninstallingTip.textContent = "正在卸载 OpenClaw，请稍候 (" + initial + "%)";
-        uninstallTick = setInterval(() => {
-          dots = (dots + 1) % 4;
-          const current = Number.parseInt((uninstallingTip.dataset.progress || "0"), 10) || 0;
-          uninstallingTip.textContent = "正在卸载 OpenClaw，请稍候 (" + current + "%)" + ".".repeat(dots);
-        }, 500);
+        if (uninstallTick) {
+          clearInterval(uninstallTick);
+          uninstallTick = null;
+        }
+        if (uninstallingTip) uninstallingTip.style.display = "none";
       } else {
         uiUninstalling = false;
         if (uninstallTick) {
           clearInterval(uninstallTick);
           uninstallTick = null;
         }
-        uninstallingTip.style.display = "none";
+        if (uninstallingTip) uninstallingTip.style.display = "none";
         applyActionButtonsState();
       }
     };
@@ -2010,6 +2815,7 @@ function renderControlPage(configPath, config, state) {
       if (uninstallingTip) {
         uninstallingTip.dataset.progress = String(data.progress || 0);
       }
+      syncUninstallToTaskModal(data);
       if (data.running) {
         if (!uiUninstalling) setUninstalling(true);
         setResult(true, data.title || "正在卸载");
@@ -2027,12 +2833,133 @@ function renderControlPage(configPath, config, state) {
       return data;
     };
 
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const parseModelsJson = () => {
+      const raw = document.getElementById("modelsJson").value || "[]";
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) {
+        throw new Error("modelsJson must be a JSON array.");
+      }
+      return parsed;
+    };
+
+    const ensureModelEntry = (modelsList, entry) => {
+      const existingIndex = modelsList.findIndex((m) => m && m.id === entry.id);
+      if (existingIndex !== -1) {
+        modelsList[existingIndex] = { ...modelsList[existingIndex], ...entry };
+        return modelsList;
+      }
+      modelsList.push(entry);
+      return modelsList;
+    };
+
+    const applyOneThingAutoFill = (data) => {
+      const fields = data.fields || {};
+      const models = fields.models || {};
+
+      if (models.provider !== undefined) document.getElementById("provider").value = models.provider;
+      if (models.baseUrl !== undefined) document.getElementById("baseUrl").value = models.baseUrl;
+      if (models.apiKeyEnv !== undefined) document.getElementById("apiKeyEnv").value = models.apiKeyEnv;
+      if (models.defaultModel !== undefined) document.getElementById("defaultModel").value = models.defaultModel;
+
+      // Merge/append model entry into modelsJson array.
+      const entry = data.modelEntryToEnsure;
+      if (entry) {
+        const list = parseModelsJson();
+        const next = ensureModelEntry(list, entry);
+        document.getElementById("modelsJson").value = JSON.stringify(next, null, 2);
+      }
+    };
+
+    const applyFeishuAutoFill = (data) => {
+      const fields = data.fields || {};
+      const feishu = fields.feishu || {};
+      if (feishu.appId !== undefined) document.getElementById("feishuAppId").value = feishu.appId;
+      if (feishu.appSecret !== undefined) document.getElementById("feishuAppSecret").value = feishu.appSecret;
+      if (feishu.webhookUrl !== undefined) document.getElementById("feishuWebhookUrl").value = feishu.webhookUrl;
+    };
+
+    const pollAutomationResultAndAutoFill = async (action, payload = {}) => {
+      const kind = action === "oneThingSetup" ? "oneThing" : "feishu";
+      const statusUrl = kind === "oneThing" ? "/automation/onething/status" : "/automation/feishu/status";
+      const applyUrl = kind === "oneThing" ? "/automation/onething/apply" : "/automation/feishu/apply";
+
+      const maxTries = 120; // ~4 minutes
+      const intervalMs = 2000;
+
+      for (let i = 0; i < maxTries; i++) {
+        const statusRes = await fetch(statusUrl, { method: "GET" });
+        const statusData = await statusRes.json();
+        if (!statusRes.ok || !statusData.ok) {
+          reportTaskModalFailure(action + " 状态轮询失败", statusData.error || statusData.title || "");
+          return;
+        }
+        if (!statusData.ready) {
+          const waitMsg = "等待浏览器自动化完成… (" + Math.floor(i + 1) + "/" + maxTries + ")";
+          setResult(true, waitMsg);
+          if (maintenanceModalStatusText) maintenanceModalStatusText.textContent = waitMsg;
+          await sleep(intervalMs);
+          continue;
+        }
+
+        if (!statusData.success) {
+          reportTaskModalFailure(
+            statusData.title || action + " 自动化失败",
+            statusData.error || statusData.logs || "",
+          );
+          return;
+        }
+
+        const applyRes = await fetch(applyUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const applyData = await applyRes.json();
+        if (!applyRes.ok || !applyData.ok) {
+          reportTaskModalFailure(
+            applyData.title || action + " 自动填充失败",
+            applyData.error || applyData.logs || "",
+          );
+          return;
+        }
+
+        try {
+          if (kind === "oneThing") {
+            applyOneThingAutoFill(applyData);
+          } else {
+            applyFeishuAutoFill(applyData);
+          }
+        } catch (e) {
+          reportTaskModalFailure(action + " 自动填充完成但回填 UI 失败", String(e));
+          return;
+        }
+
+        setResult(true, applyData.title || "自动填充完成");
+        if (applyData.logs) setLogs(applyData.logs);
+        if (maintenanceModalStatusText) {
+          maintenanceModalStatusText.textContent =
+            applyData.title || "已回填到表单，可在下方核对后保存配置。";
+        }
+        if (maintenanceModalLogs && applyData.logs) {
+          maintenanceModalLogs.textContent = applyData.logs;
+        }
+        return;
+      }
+
+      reportTaskModalFailure(
+        action + " 自动化结果超时",
+        "超过轮询上限，建议检查 ~/.openclaw/*-setup-result.json 文件与步骤日志。",
+      );
+    };
+
     async function invokeAction(action, payload = {}) {
       if (uiUninstalling && action !== "uninstall") {
         showFailure("正在卸载 OpenClaw，其他操作已禁用，请等待卸载完成。");
         return;
       }
-      if (!runtimeOpenclawInstalled && action !== "install") {
+      if (!runtimeOpenclawInstalled && !["install", "oneThingSetup", "feishuSetup"].includes(action)) {
         showFailure("OpenClaw 尚未安装，请先点击“安装 OpenClaw”。");
         return;
       }
@@ -2059,21 +2986,231 @@ function renderControlPage(configPath, config, state) {
         return;
       }
       if (action === "uninstall") {
-        setResult(true, "正在启动卸载任务...");
-        const startRes = await fetch("/uninstall/start", { method: "POST" });
-        const startData = await startRes.json();
-        if (!startRes.ok || !startData.ok) {
-          showFailure("卸载启动失败: " + (startData.title || "无法启动卸载"), startData.logs || "");
+        if (uiMaintenanceRunning) {
+          setResult(false, "已有升级/检查任务进行中，请稍候再卸载。");
           return;
         }
-        setUninstalling(true);
-        await refreshUninstallStatus();
-        const poll = setInterval(async () => {
-          const data = await refreshUninstallStatus();
-          if (!data.running) {
-            clearInterval(poll);
+        openTaskModal("卸载 OpenClaw", { context: "uninstall", showLogs: true });
+        disableAllButtons(true);
+        if (maintenanceModalClose) maintenanceModalClose.disabled = true;
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        try {
+          setResult(true, "正在启动卸载任务...");
+          const startRes = await fetch("/uninstall/start", { method: "POST" });
+          const startData = await startRes.json();
+          if (!startRes.ok || !startData.ok) {
+            setMaintenanceSpinner(false);
+            reportTaskModalFailure(startData.title || "无法启动卸载", startData.logs || "");
+            if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+            disableAllButtons(false);
+            applyActionButtonsState();
+            return;
           }
-        }, 2000);
+          setResult(true, startData.title || "任务已启动");
+          setUninstalling(true);
+          const first = await refreshUninstallStatus();
+          if (!first.running) {
+            setMaintenanceSpinner(false);
+            if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+            disableAllButtons(false);
+            applyActionButtonsState();
+            await syncRuntimeState();
+            return;
+          }
+          taskModalPoll = setInterval(async () => {
+            const data = await refreshUninstallStatus();
+            if (!data.running) {
+              clearInterval(taskModalPoll);
+              taskModalPoll = null;
+              setMaintenanceSpinner(false);
+              if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+              disableAllButtons(false);
+              applyActionButtonsState();
+              await syncRuntimeState();
+            }
+          }, 2000);
+        } catch (error) {
+          setMaintenanceSpinner(false);
+          reportTaskModalFailure(String(error), "");
+          if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+          disableAllButtons(false);
+          applyActionButtonsState();
+          setUninstalling(false);
+        }
+        return;
+      }
+      if (action === "update" || action === "fix") {
+        if (uiInstalling) {
+          showFailure("正在安装 OpenClaw，请等待安装完成后再试。");
+          return;
+        }
+        if (uiMaintenanceRunning) {
+          setResult(false, "已有升级/检查任务在进行中。");
+          return;
+        }
+        const kind = action;
+        const titleCn = kind === "update" ? "升级 OpenClaw" : "自动修复检查";
+        openTaskModal(titleCn, { context: "maintenance", showLogs: true });
+        uiMaintenanceRunning = true;
+        disableAllButtons(true);
+        if (maintenanceModalClose) maintenanceModalClose.disabled = true;
+
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+        try {
+          const startRes = await fetch("/maintenance/start", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ kind }),
+          });
+          const startData = await startRes.json();
+          if (!startRes.ok || !startData.ok) {
+            setMaintenanceSpinner(false);
+            if (maintenanceModalStatusText) maintenanceModalStatusText.textContent = startData.title || "无法启动任务";
+            if (maintenanceModalLogs) maintenanceModalLogs.textContent = startData.logs || "";
+            setResult(false, startData.title || "无法启动任务");
+            setLogs(startData.logs || "");
+            if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+            disableAllButtons(false);
+            applyActionButtonsState();
+            uiMaintenanceRunning = false;
+            return;
+          }
+          setResult(true, startData.title || "任务已启动");
+          const first = await refreshMaintenanceStatus();
+          if (!first.running) {
+            setMaintenanceSpinner(false);
+            if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+            disableAllButtons(false);
+            applyActionButtonsState();
+            uiMaintenanceRunning = false;
+            setResult(Boolean(first.ok), first.title || (first.ok ? "完成" : "失败"));
+            setLogs((first.logs || []).join("\\n"));
+            await syncRuntimeState();
+            return;
+          }
+          taskModalPoll = setInterval(async () => {
+            const data = await refreshMaintenanceStatus();
+            if (!data.running) {
+              clearInterval(taskModalPoll);
+              taskModalPoll = null;
+              setMaintenanceSpinner(false);
+              if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+              disableAllButtons(false);
+              applyActionButtonsState();
+              uiMaintenanceRunning = false;
+              setResult(Boolean(data.ok), data.title || (data.ok ? "完成" : "失败"));
+              setLogs((data.logs || []).join("\\n"));
+              await syncRuntimeState();
+            }
+          }, 2000);
+        } catch (error) {
+          setMaintenanceSpinner(false);
+          if (maintenanceModalStatusText) maintenanceModalStatusText.textContent = String(error);
+          setResult(false, String(error));
+          if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+          disableAllButtons(false);
+          applyActionButtonsState();
+          uiMaintenanceRunning = false;
+        }
+        return;
+      }
+
+      if (action === "runGateway" || action === "restartGateway") {
+        if (uiUninstalling) {
+          showFailure("正在卸载 OpenClaw，其他操作已禁用，请等待卸载完成。");
+          return;
+        }
+        if (!runtimeDaemonReady) {
+          showFailure("需要先完成 openclaw 配置（保存配置将执行 onboard --install-daemon）后，才能执行该操作。");
+          return;
+        }
+        const titleCn = action === "runGateway" ? "启动 Gateway" : "重启 Gateway";
+        openTaskModal(titleCn, { compact: true, showLogs: false, context: "gateway" });
+        if (maintenanceModalClose) maintenanceModalClose.disabled = true;
+        disableAllButtons(true);
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        try {
+          if (maintenanceModalStatusText) maintenanceModalStatusText.textContent = "正在执行…";
+          const response = await fetch("/action", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ action, payload }),
+          });
+          const data = await response.json();
+          setMaintenanceSpinner(false);
+          if (!response.ok || !data.ok) {
+            reportTaskModalFailure(data.title || "执行失败", data.logs || "");
+            if (data.logs && maintenanceModalLogs) {
+              maintenanceModalLogs.classList.remove("maintenance-modal-logs--hidden");
+              maintenanceModalLogs.textContent = data.logs;
+            }
+            if (maintenanceModalPanel && data.logs) {
+              maintenanceModalPanel.classList.remove("maintenance-modal-panel--compact");
+            }
+            setResult(false, data.title || "执行失败");
+            if (data.logs) setLogs(data.logs);
+          } else {
+            if (maintenanceModalStatusText) maintenanceModalStatusText.textContent = data.title || "完成";
+            setResult(true, data.title || "完成");
+            setLogs(data.logs || "");
+          }
+          if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+          disableAllButtons(false);
+          applyActionButtonsState();
+          await syncRuntimeState();
+        } catch (error) {
+          setMaintenanceSpinner(false);
+          reportTaskModalFailure(String(error), "");
+          if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+          disableAllButtons(false);
+          applyActionButtonsState();
+        }
+        return;
+      }
+
+      if (action === "oneThingSetup" || action === "feishuSetup") {
+        if (uiUninstalling) {
+          showFailure("正在卸载 OpenClaw，其他操作已禁用，请等待卸载完成。");
+          return;
+        }
+        const titleCn = action === "oneThingSetup" ? "OneThingAI 配置引导" : "飞书配置（Playwright）";
+        openTaskModal(titleCn, { context: "automation", showLogs: true });
+        if (maintenanceModalClose) maintenanceModalClose.disabled = true;
+        disableAllButtons(true);
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        try {
+          if (maintenanceModalStatusText) maintenanceModalStatusText.textContent = "正在启动自动化脚本…";
+          const response = await fetch("/action", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ action, payload }),
+          });
+          const data = await response.json();
+          if (!response.ok || !data.ok) {
+            reportTaskModalFailure(
+              data.title || (action === "oneThingSetup" ? "OneThing 启动失败" : "飞书配置启动失败"),
+              data.logs || "",
+            );
+            return;
+          }
+          setResult(true, data.title || "已启动");
+          setLogs(data.logs || "");
+          if (maintenanceModalLogs) maintenanceModalLogs.textContent = data.logs || "";
+          if (maintenanceModalStatusText) {
+            maintenanceModalStatusText.textContent = "请在打开的浏览器中完成操作，等待结果回写…";
+          }
+          setMaintenanceSpinner(true);
+          await pollAutomationResultAndAutoFill(action, payload);
+        } catch (error) {
+          reportTaskModalFailure(String(error), "");
+        } finally {
+          setMaintenanceSpinner(false);
+          if (maintenanceModalClose) maintenanceModalClose.disabled = false;
+          disableAllButtons(false);
+          applyActionButtonsState();
+          await syncRuntimeState();
+        }
         return;
       }
 
@@ -2360,11 +3497,15 @@ async function runConfigureUiCommand(options) {
         }
         if (req.method === "POST" && req.url === "/install/start") {
             const started = startInstallJob();
+            let failTitle = "安装任务已在运行中";
+            if (!started && maintenanceJob.running && !installJob.running) {
+                failTitle = "已有升级/检查任务进行中，请等待完成后再安装";
+            }
             debugLog("install-start-route", { started });
             res.setHeader("content-type", "application/json");
             res.end(JSON.stringify({
                 ok: started,
-                title: started ? "安装任务已启动" : "安装任务已在运行中",
+                title: started ? "安装任务已启动" : failTitle,
             }));
             return;
         }
@@ -2391,7 +3532,7 @@ async function runConfigureUiCommand(options) {
             res.setHeader("content-type", "application/json");
             res.end(JSON.stringify({
                 ok: started,
-                title: started ? "卸载任务已启动" : "当前已有运行中的安装/卸载任务",
+                title: started ? "卸载任务已启动" : "当前已有运行中的安装/卸载/维护任务",
             }));
             return;
         }
@@ -2405,6 +3546,59 @@ async function runConfigureUiCommand(options) {
             res.end(JSON.stringify({
                 ...uninstallJob,
                 logs: uninstallJob.logs.slice(-120),
+            }));
+            return;
+        }
+        if (req.method === "POST" && req.url === "/maintenance/start") {
+            try {
+                const body = await readBody(req);
+                const kindRaw = asString(body.kind)?.trim() ?? "";
+                const kind = kindRaw === "fix" ? "fix" : kindRaw === "update" ? "update" : "";
+                if (kind !== "update" && kind !== "fix") {
+                    res.statusCode = 400;
+                    res.setHeader("content-type", "application/json");
+                    res.end(JSON.stringify({ ok: false, title: "无效的 kind", logs: "请使用 update 或 fix。" }));
+                    return;
+                }
+                const started = startMaintenanceJob(kind);
+                debugLog("maintenance-start-route", { started, kind });
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({
+                    ok: started,
+                    title: started
+                        ? kind === "update"
+                            ? "升级任务已启动"
+                            : "检查任务已启动"
+                        : installJob.running || uninstallJob.running
+                            ? "当前已有运行中的安装/卸载任务"
+                            : "维护任务已在运行中",
+                }));
+            }
+            catch (error) {
+                res.statusCode = 500;
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({ ok: false, title: "维护任务启动失败", logs: String(error) }));
+            }
+            return;
+        }
+        if (req.method === "GET" && req.url === "/maintenance/status") {
+            const now = Date.now();
+            if (now - lastMaintenanceStatusLogAt > 5000) {
+                debugLog("maintenance-status-route", { running: maintenanceJob.running, progress: maintenanceJob.progress });
+                lastMaintenanceStatusLogAt = now;
+            }
+            const elapsedSeconds = maintenanceJob.stepStartedAt
+                ? Math.max(0, Math.floor((Date.now() - maintenanceJob.stepStartedAt) / 1000))
+                : 0;
+            const idleSeconds = maintenanceJob.lastActivityAt
+                ? Math.max(0, Math.floor((Date.now() - maintenanceJob.lastActivityAt) / 1000))
+                : 0;
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({
+                ...maintenanceJob,
+                elapsedSeconds,
+                idleSeconds,
+                logs: maintenanceJob.logs.slice(-120),
             }));
             return;
         }
@@ -2467,6 +3661,161 @@ async function runConfigureUiCommand(options) {
                 res.statusCode = 500;
                 res.setHeader("content-type", "application/json");
                 res.end(JSON.stringify({ ok: false, errors: [String(error)] }));
+            }
+            return;
+        }
+        if (req.method === "GET" && req.url === "/automation/onething/status") {
+            const result = await tryReadJsonFile(getOpenClawSetupResultPath("onething"));
+            const ready = result !== null;
+            if (!ready) {
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({ ok: true, ready: false, success: false, title: "等待 OneThing 自动化结果..." }));
+                return;
+            }
+            const apiKey = typeof result?.captured?.apiKey === "string" ? result.captured.apiKey.trim() : "";
+            const success = apiKey.length > 0;
+            const tailSteps = Array.isArray(result?.steps) ? result.steps.slice(-10) : [];
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({
+                ok: true,
+                ready: true,
+                success,
+                title: success ? "OneThing 自动化已完成" : "OneThing 自动化未捕获到 API Key",
+                error: success
+                    ? undefined
+                    : tailSteps.length > 0
+                        ? "最近步骤：\n" + tailSteps.map((s) => "- " + s).join("\n")
+                        : "脚本已结束，但未捕获到 API Key。",
+            }));
+            return;
+        }
+        if (req.method === "POST" && req.url === "/automation/onething/apply") {
+            try {
+                const result = await tryReadJsonFile(getOpenClawSetupResultPath("onething"));
+                if (!result) {
+                    res.statusCode = 404;
+                    res.setHeader("content-type", "application/json");
+                    res.end(JSON.stringify({ ok: false, title: "OneThing 结果尚未就绪" }));
+                    return;
+                }
+                const apiKey = typeof result?.captured?.apiKey === "string" ? result.captured.apiKey.trim() : "";
+                if (!apiKey) {
+                    res.statusCode = 400;
+                    res.setHeader("content-type", "application/json");
+                    res.end(JSON.stringify({
+                        ok: false,
+                        title: "OneThing 自动填充失败",
+                        error: "未在结果中捕获到 API Key，请在 OneThing 浏览器中手动完成并重试。",
+                    }));
+                    return;
+                }
+                await (0, promises_1.mkdir)(getOpenClawDir(), { recursive: true });
+                const envPath = getOpenClawDotEnvPath();
+                let envText = "";
+                try {
+                    envText = await (0, promises_1.readFile)(envPath, "utf8");
+                }
+                catch {
+                    envText = "";
+                }
+                const nextEnv = upsertDotEnvVar(envText, "ONETHINGAI_API_KEY", apiKey);
+                await (0, promises_1.writeFile)(envPath, nextEnv, "utf8");
+                const modelEntryToEnsure = {
+                    id: "minimax-m2.1",
+                    name: "Minimax M2.1",
+                    contextWindow: 200000,
+                    maxTokens: 8192,
+                    reasoning: false,
+                };
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({
+                    ok: true,
+                    title: "OneThing 配置已自动回填",
+                    logs: "已回填模型配置，并写入 ~/.openclaw/.env：ONETHINGAI_API_KEY（已隐藏）",
+                    fields: {
+                        models: {
+                            provider: "onethingai",
+                            baseUrl: "https://api-model.onethingai.com/v2/openai",
+                            apiKeyEnv: "ONETHINGAI_API_KEY",
+                            defaultModel: "onethingai/minimax-m2.1",
+                        },
+                    },
+                    modelEntryToEnsure,
+                }));
+            }
+            catch (error) {
+                res.statusCode = 500;
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({ ok: false, title: "OneThing 回填失败", error: String(error) }));
+            }
+            return;
+        }
+        if (req.method === "GET" && req.url === "/automation/feishu/status") {
+            const result = await tryReadJsonFile(getOpenClawSetupResultPath("feishu"));
+            const ready = result !== null;
+            if (!ready) {
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({ ok: true, ready: false, success: false, title: "等待飞书自动化结果..." }));
+                return;
+            }
+            const appId = typeof result?.captured?.appId === "string" ? result.captured.appId.trim() : "";
+            const appSecret = typeof result?.captured?.appSecret === "string" ? result.captured.appSecret.trim() : "";
+            const webhookUrl = typeof result?.captured?.webhookUrl === "string" ? result.captured.webhookUrl.trim() : "";
+            const success = appId.length > 0 && appSecret.length > 0 && webhookUrl.length > 0;
+            const tailSteps = Array.isArray(result?.steps) ? result.steps.slice(-10) : [];
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({
+                ok: true,
+                ready: true,
+                success,
+                title: success ? "飞书自动化已完成" : "飞书自动化未捕获到所需字段",
+                error: success
+                    ? undefined
+                    : tailSteps.length > 0
+                        ? "最近步骤：\n" + tailSteps.map((s) => "- " + s).join("\n")
+                        : "脚本已结束，但未捕获到 App ID/Secret/Webhook URL。",
+            }));
+            return;
+        }
+        if (req.method === "POST" && req.url === "/automation/feishu/apply") {
+            try {
+                const result = await tryReadJsonFile(getOpenClawSetupResultPath("feishu"));
+                if (!result) {
+                    res.statusCode = 404;
+                    res.setHeader("content-type", "application/json");
+                    res.end(JSON.stringify({ ok: false, title: "飞书结果尚未就绪" }));
+                    return;
+                }
+                const appId = typeof result?.captured?.appId === "string" ? result.captured.appId.trim() : "";
+                const appSecret = typeof result?.captured?.appSecret === "string" ? result.captured.appSecret.trim() : "";
+                const webhookUrl = typeof result?.captured?.webhookUrl === "string" ? result.captured.webhookUrl.trim() : "";
+                if (!appId || !appSecret || !webhookUrl) {
+                    res.statusCode = 400;
+                    res.setHeader("content-type", "application/json");
+                    res.end(JSON.stringify({
+                        ok: false,
+                        title: "飞书自动填充失败",
+                        error: "未在结果中捕获到完整字段，请在飞书浏览器中手动完成并重试。",
+                    }));
+                    return;
+                }
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({
+                    ok: true,
+                    title: "飞书配置已自动回填",
+                    fields: {
+                        feishu: {
+                            appId,
+                            appSecret,
+                            webhookUrl,
+                        },
+                    },
+                }));
+            }
+            catch (error) {
+                res.statusCode = 500;
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({ ok: false, title: "飞书回填失败", error: String(error) }));
             }
             return;
         }

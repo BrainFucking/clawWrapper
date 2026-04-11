@@ -86,6 +86,24 @@ npx tsx cli/src/index.ts feishu:setup --bot-name "Claw Assistant" --output ./.fe
 
 This command uses Playwright and pauses for manual login/verification steps.
 
+v2 engine (scaffold + checkpoint/report support):
+
+```bash
+npx tsx cli/src/index.ts feishu:setup --engine v2 --bot-name "Claw Assistant" --output ./.feishu-bot.json --secret-store file
+```
+
+Optional live webhook probe (sends one test text message):
+
+```bash
+npx tsx cli/src/index.ts feishu:setup --engine v2 --bot-name "Claw Assistant" --output ./.feishu-bot.json --secret-store file --webhook-probe
+```
+
+Resume a paused v2 run:
+
+```bash
+npx tsx cli/src/index.ts feishu:setup --engine v2 --resume-run-id <run-id> --output ./.feishu-bot.json
+```
+
 ### Configure OpenClaw + Feishu
 
 ```bash
@@ -136,3 +154,36 @@ npx tsx cli/src/index.ts uninstall --purge-all
 ```
 
 Use `--dry-run` first for safer cleanup preview.
+
+## End-to-End Verify: 自动化结果回填
+
+1. 启动 UI 并进入控制页
+   - `npx tsx cli/src/index.ts manager:ui --config ~/.openclaw/config.json --env-out ./.env.openclaw`
+   - 若未安装 OpenClaw，会先进入 `/onboarding`；完成安装后进入 `/control`。
+
+2. OneThingAI 自动化（模型配置引导）
+   - 点击 `模型配置引导（OneThingAI）`（或 `第一步：去模型/通道配置` 后再点击）。
+   - 等待弹出的浏览器完成登录/配置；脚本结束后 UI 会自动回填并追加 `modelsJson` 里的模型条目。
+   - 回填完成后，确认 `~/.openclaw/.env` 中出现 `ONETHINGAI_API_KEY=`（值会被隐藏显示/不会在 UI 日志里明文回显）。
+
+3. 飞书自动化（渠道配置）
+   - 点击 `配置飞书（Playwright）`，在弹出的浏览器里完成登录并授权。
+   - 脚本完成后 UI 会自动回填 `feishuAppId/feishuAppSecret/feishuWebhookUrl`。
+
+4. 保存配置并初始化
+   - 点击 `保存配置`。
+   - 成功后 UI 会执行 `openclaw onboard --install-daemon`（但不会自动启动 Gateway）。
+
+5. 手动启动 Gateway 并验证聊天
+   - 在 UI 点击 `启动 Gateway`。
+   - 打开 `/chat` 页面，按你的实际访问地址验证 WebChat 可用。
+
+## 失败排查（关键日志/文件）
+
+- OneThing 自动化结果：`~/.openclaw/onething-setup-result.json`
+- 飞书自动化结果：`~/.openclaw/feishu-setup-result.json`
+- 若 UI 显示“等待/超时/未捕获到字段”：
+  - 先确认上面两个 result JSON 文件是否更新（脚本是否走完）。
+  - 再查看 UI 下方的 action logs/错误提示（会包含最近步骤 tail）。
+- 若启动自动化进程失败（Detached spawn 失败）：
+  - UI 的错误信息中会附带 `log file: ...` 路径，打开该日志文件可查看 stdout/stderr tail。

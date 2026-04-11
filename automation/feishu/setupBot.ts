@@ -1,6 +1,7 @@
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { feishuSelectors, feishuUrls } from "./selectors";
+import { feishuAppSubpageUrls, feishuSelectors, feishuUrls } from "./selectors";
 
 export interface GuidedSetupOptions {
   outputPath: string;
@@ -86,6 +87,165 @@ async function fillFirstVisible(page: any, selectors: string[], value: string): 
   return false;
 }
 
+async function fillPermissionImportTextBestEffort(page: any, value: string): Promise<boolean> {
+  // 1) direct fill via known inputs
+  const filledDirect = await fillFirstVisible(page, feishuSelectors.permissionImportInputs, value);
+  if (filledDirect) {
+    return true;
+  }
+  // 2) click contenteditable then keyboard paste/type fallback
+  try {
+    const editable = page.locator('[contenteditable="true"]').first();
+    if (await editable.isVisible({ timeout: 1200 })) {
+      await editable.click({ timeout: 2000 });
+      await page.keyboard.press("Meta+A").catch(async () => {
+        await page.keyboard.press("Control+A");
+      });
+      await page.keyboard.type(value, { delay: 0 });
+      return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+async function capturePageDebug(page: any, label: string, steps: string[]): Promise<void> {
+  try {
+    const url = page.url();
+    const body = await page.locator("body").innerText().catch(() => "");
+    const snippet = body.slice(0, 240).replaceAll("\n", " ");
+    steps.push(`DEBUG ${label} url=${url}`);
+    steps.push(`DEBUG ${label} snippet=${snippet}`);
+  } catch {
+    // best-effort
+  }
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function collectCliAppIdsFromLinks(page: any): Promise<string[]> {
+  const links = page.locator('a[href*="/app/cli_"]');
+  const n = await links.count().catch(() => 0);
+  const ids = new Set<string>();
+  for (let i = 0; i < n; i++) {
+    const href = (await links.nth(i).getAttribute("href").catch(() => null)) ?? "";
+    const m = href.match(/(cli_[a-zA-Z0-9]+)/);
+    if (m) {
+      ids.add(m[1]);
+    }
+  }
+  return [...ids];
+}
+
+async function openAppDetailsByNameBestEffort(page: any, botName: string, steps: string[]): Promise<boolean> {
+  const normalized = botName.trim();
+  if (!normalized) return false;
+  try {
+    const appLink = page
+      .locator('a[href*="/app/cli_"]')
+      .filter({ hasText: new RegExp(escapeRegExp(normalized), "i") })
+      .first();
+    if (await appLink.isVisible({ timeout: 3000 })) {
+      await appLink.click({ timeout: 4000 });
+      await delay(1500);
+      steps.push(`Opened app via list link matching name: ${normalized}`);
+      return true;
+    }
+  } catch {
+    // continue
+  }
+  try {
+    const byText = page.getByText(normalized, { exact: false }).first();
+    if (await byText.isVisible({ timeout: 2500 })) {
+      await byText.click({ timeout: 3000 });
+      await delay(1200);
+      steps.push(`Opened app details by name: ${normalized}`);
+      return true;
+    }
+  } catch {
+    // continue
+  }
+  try {
+    const entry = page.locator(
+      `a:has-text("${normalized}"), button:has-text("${normalized}"), [role="link"]:has-text("${normalized}")`,
+    ).first();
+    if (await entry.isVisible({ timeout: 2500 })) {
+      await entry.click({ timeout: 3000 });
+      await delay(1200);
+      steps.push(`Opened app details via link/button: ${normalized}`);
+      return true;
+    }
+  } catch {
+    // continue
+  }
+  try {
+    const manage = page.locator('button:has-text("管理"), a:has-text("管理"), button:has-text("进入开发"), a:has-text("进入开发")').first();
+    if (await manage.isVisible({ timeout: 2000 })) {
+      await manage.click({ timeout: 3000 });
+      await delay(1200);
+      steps.push("Opened app details via 管理/进入开发 button.");
+      return true;
+    }
+  } catch {
+    // continue
+  }
+  return false;
+}
+
+async function resolveCliAppIdFromContext(page: any, botName: string, steps: string[]): Promise<string | null> {
+  const fromUrl = extractByRegex(page.url(), /\/(cli_[a-zA-Z0-9]+)/);
+  if (fromUrl) {
+    return fromUrl;
+  }
+  const ids = await collectCliAppIdsFromLinks(page);
+  if (ids.length === 1) {
+    const only = ids[0];
+    steps.push(`Detected single app id on page: ${only}`);
+    return only;
+  }
+  const normalized = botName.trim();
+  if (normalized) {
+    for (const id of ids) {
+      const link = page.locator(`a[href*="${id}"]`).filter({ hasText: new RegExp(escapeRegExp(normalized), "i") }).first();
+      if (await link.isVisible({ timeout: 800 }).catch(() => false)) {
+        await link.click({ timeout: 4000 }).catch(() => {});
+        await delay(1500);
+        steps.push(`Clicked list entry for ${id} matching "${normalized}".`);
+        const after = extractByRegex(page.url(), /\/(cli_[a-zA-Z0-9]+)/);
+        return after ?? id;
+      }
+    }
+  }
+  return null;
+}
+
+async function gotoAppSubpageMatching(
+  page: any,
+  appId: string,
+  steps: string[],
+  label: string,
+  matchers: RegExp[],
+): Promise<boolean> {
+  for (const url of feishuAppSubpageUrls(appId)) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 28000 });
+      await delay(1200);
+      const body = await page.locator("body").innerText().catch(() => "");
+      const lower = body.toLowerCase();
+      if (matchers.some((re) => re.test(lower) || re.test(body))) {
+        steps.push(`Reached ${label} (matched content) via ${url}`);
+        return true;
+      }
+    } catch {
+      // try next
+    }
+  }
+  return false;
+}
+
 function extractByRegex(text: string, regex: RegExp): string {
   const match = text.match(regex);
   return match?.[1]?.trim() ?? "";
@@ -165,10 +325,17 @@ export async function runGuidedFeishuSetup(
   options: GuidedSetupOptions,
 ): Promise<GuidedSetupResult> {
   const playwright = await import("playwright");
-  const browser = await playwright.chromium.launch({ headless: options.headless });
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  const userDataDir = path.join(
+    tmpdir(),
+    `clawwrapper-feishu-${Date.now()}-${process.pid}`,
+  );
+  await mkdir(userDataDir, { recursive: true });
+  const context = await playwright.chromium.launchPersistentContext(userDataDir, {
+    headless: options.headless,
+  });
+  const page = context.pages()[0] ?? (await context.newPage());
   const steps: string[] = [];
+  steps.push(`飞书应用配置说明（官方）: ${feishuUrls.docReference}`);
 
   await page.goto(feishuUrls.developerConsole, { waitUntil: "domcontentloaded" });
   const loggedIn = await waitForManualLogin(page, 5 * 60 * 1000, steps);
@@ -179,7 +346,7 @@ export async function runGuidedFeishuSetup(
       steps,
     };
     await writeFile(path.resolve(options.outputPath), `${JSON.stringify(timeoutResult, null, 2)}\n`, "utf8");
-    await browser.close();
+    await context.close();
     return timeoutResult;
   }
 
@@ -207,6 +374,16 @@ export async function runGuidedFeishuSetup(
   }
 
   try {
+    const tab = await clickFirstVisible(page, feishuSelectors.selfBuiltAppTabButtons);
+    if (tab) {
+      steps.push("Focused 企业自建应用 list (if tab was present).");
+      await delay(800);
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
     const named = await fillFirstVisible(page, [feishuSelectors.appNameInput], options.botName);
     if (named) {
       steps.push(`Filled app/bot name: ${options.botName}`);
@@ -220,7 +397,54 @@ export async function runGuidedFeishuSetup(
   }
 
   try {
-    const openedPerm = await clickFirstVisible(page, feishuSelectors.permissionNavButtons);
+    await page.waitForURL(/\/app\/cli_[a-zA-Z0-9]+/i, { timeout: 18000 });
+    steps.push("Navigated into app detail URL after create/save.");
+  } catch {
+    // stay on list or dialog
+  }
+
+  let appId = await resolveCliAppIdFromContext(page, options.botName, steps);
+  if (!appId) {
+    const opened = await openAppDetailsByNameBestEffort(page, options.botName, steps);
+    if (!opened) {
+      steps.push("App list entry not found by name; try manual click or refresh app list.");
+      await capturePageDebug(page, "app-details-missing", steps);
+    }
+    appId = await resolveCliAppIdFromContext(page, options.botName, steps);
+  }
+  if (!appId) {
+    try {
+      await page.goto("https://open.feishu.cn/app", { waitUntil: "domcontentloaded", timeout: 25000 });
+      await delay(1500);
+      await clickFirstVisible(page, feishuSelectors.selfBuiltAppTabButtons);
+      await delay(800);
+      steps.push("Reloaded https://open.feishu.cn/app (no query) and retried app id discovery.");
+      appId = await resolveCliAppIdFromContext(page, options.botName, steps);
+    } catch {
+      steps.push("Reload app list for cli_ discovery failed.");
+    }
+  }
+  if (appId) {
+    steps.push(`Using app id ${appId} for deep links (凭证/权限/应用能力).`);
+    const credOk = await gotoAppSubpageMatching(page, appId, steps, "credentials/basic info", [
+      /凭证|app\s*id|app\s*secret|应用密钥|基础信息/i,
+    ]);
+    if (!credOk) {
+      await clickFirstVisible(page, feishuSelectors.credentialNavButtons);
+      await delay(800);
+    }
+  }
+
+  try {
+    let openedPerm = false;
+    if (appId) {
+      openedPerm = await gotoAppSubpageMatching(page, appId, steps, "permission management", [
+        /权限管理|批量导入|开通权限|api\s*权限|应用身份权限/i,
+      ]);
+    }
+    if (!openedPerm) {
+      openedPerm = await clickFirstVisible(page, feishuSelectors.permissionNavButtons);
+    }
     if (openedPerm) {
       steps.push("Opened permission management page.");
       await delay(1000);
@@ -228,7 +452,7 @@ export async function runGuidedFeishuSetup(
       if (openedBatchImport) {
         steps.push("Opened batch import dialog.");
         await delay(500);
-        const filledPermissionJson = await fillFirstVisible(page, feishuSelectors.permissionImportInputs, FEISHU_PERMISSION_IMPORT_JSON);
+        const filledPermissionJson = await fillPermissionImportTextBestEffort(page, FEISHU_PERMISSION_IMPORT_JSON);
         if (filledPermissionJson) {
           steps.push("Filled permission import JSON.");
           await clickFirstVisible(page, feishuSelectors.confirmButtons);
@@ -239,16 +463,27 @@ export async function runGuidedFeishuSetup(
         }
       } else {
         steps.push("Batch import button not found; please configure permissions manually.");
+        await capturePageDebug(page, "permission-batch-import-missing", steps);
       }
     } else {
       steps.push("Permission page entry not found; skipped permission automation.");
+      await capturePageDebug(page, "permission-nav-missing", steps);
     }
   } catch {
     steps.push("Permission automation partially failed due to UI mismatch.");
+    await capturePageDebug(page, "permission-exception", steps);
   }
 
   try {
-    const openedCapability = await clickFirstVisible(page, feishuSelectors.capabilityNavButtons);
+    let openedCapability = false;
+    if (appId) {
+      openedCapability = await gotoAppSubpageMatching(page, appId, steps, "app capabilities / bot", [
+        /应用能力|添加应用能力|机器人|启用机器人|bot capability/i,
+      ]);
+    }
+    if (!openedCapability) {
+      openedCapability = await clickFirstVisible(page, feishuSelectors.capabilityNavButtons);
+    }
     if (openedCapability) {
       steps.push("Opened capability section.");
       await delay(800);
@@ -256,23 +491,25 @@ export async function runGuidedFeishuSetup(
       await delay(800);
       await fillFirstVisible(page, feishuSelectors.botNameInputs, options.botName);
       await clickFirstVisible(page, [feishuSelectors.saveButton]);
-      steps.push("Bot capability setup attempted.");
+      steps.push("Bot capability setup attempted (官方文档: 应用能力 > 机器人).");
     } else {
       steps.push("Capability page entry not found; skipped bot capability automation.");
+      await capturePageDebug(page, "capability-nav-missing", steps);
     }
   } catch {
     steps.push("Bot capability automation partially failed due to UI mismatch.");
+    await capturePageDebug(page, "capability-exception", steps);
   }
 
   const bodyText = await page.locator("body").innerText().catch(() => "");
   const appIdFromUrl = extractByRegex(page.url(), /(cli_[a-zA-Z0-9]+)/);
-  const appId = appIdFromUrl || extractByRegex(bodyText, /(cli_[a-zA-Z0-9]{8,})/);
+  const capturedAppId = appIdFromUrl || appId || extractByRegex(bodyText, /(cli_[a-zA-Z0-9]{8,})/);
   const appSecret = extractByRegex(bodyText, /(secret_[a-zA-Z0-9_\-]+)/i);
   const webhookUrl = extractByRegex(bodyText, /(https:\/\/open\.feishu\.cn\/open-apis\/bot\/v2\/hook\/[a-zA-Z0-9_\-]+)/i);
 
   const result: GuidedSetupResult = {
     outputPath: options.outputPath,
-    captured: { appId, appSecret, webhookUrl },
+    captured: { appId: capturedAppId, appSecret, webhookUrl },
     steps,
   };
 
@@ -282,6 +519,6 @@ export async function runGuidedFeishuSetup(
     "utf8",
   );
 
-  await browser.close();
+  await context.close();
   return result;
 }

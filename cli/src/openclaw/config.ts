@@ -135,6 +135,39 @@ export function validateConfig(config: OpenClawConfig): string[] {
   const appId = config.channels.feishu.appId || config.feishu.appId;
   const appSecret = config.channels.feishu.appSecret || config.feishu.appSecret;
   const webhookUrl = config.channels.feishu.webhookUrl || config.feishu.webhookUrl;
+
+  // Model config required for OpenClaw onboarding:
+  // - provider/baseUrl define the model endpoint
+  // - apiKeyEnv defines which env var holds the api key
+  // - defaultModel selects the primary model reference
+  const modelsProvider = config.models.provider?.trim() ?? "";
+  const modelsBaseUrl = config.models.baseUrl?.trim() ?? "";
+  const modelsApiKeyEnv = config.models.apiKeyEnv?.trim() ?? "";
+  const modelsDefaultModel = config.models.defaultModel?.trim() ?? "";
+  if (!modelsProvider) {
+    errors.push("models.provider is required.");
+  }
+  if (!modelsBaseUrl) {
+    errors.push("models.baseUrl is required.");
+  }
+  if (!modelsApiKeyEnv) {
+    errors.push("models.apiKeyEnv is required.");
+  }
+  if (!modelsDefaultModel) {
+    errors.push("models.defaultModel is required.");
+  }
+  if (config.models.list.length === 0) {
+    errors.push("models.list must include at least one model entry.");
+  }
+
+  // Lightweight numeric sanity checks (keeps error messages actionable).
+  if (
+    config.models.list.some(
+      (m) => !Number.isFinite(m.contextWindow) || m.contextWindow <= 0 || !Number.isFinite(m.maxTokens) || m.maxTokens <= 0,
+    )
+  ) {
+    errors.push("models.list entries require positive contextWindow and maxTokens.");
+  }
   if (feishuEnabled && !appId.trim()) {
     errors.push("feishu.appId is required.");
   }
@@ -144,7 +177,7 @@ export function validateConfig(config: OpenClawConfig): string[] {
   if (feishuEnabled && !webhookUrl.trim()) {
     errors.push("feishu.webhookUrl is required.");
   }
-  if (config.models.list.some((model) => !model.id.trim())) {
+  if (config.models.list.some((model) => !model.id?.trim())) {
     errors.push("models.list entries require model id.");
   }
   return errors;
