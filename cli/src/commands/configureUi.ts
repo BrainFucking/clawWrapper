@@ -195,6 +195,15 @@ function getOpenClawDotEnvPath(): string {
   return join(resolveHomeDir(), ".openclaw", ".env");
 }
 
+async function clearSetupResult(kind: SetupResultKind): Promise<void> {
+  const filePath = getOpenClawSetupResultPath(kind);
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Missing/stale result cleanup is best-effort.
+  }
+}
+
 async function tryReadJsonFile<T = unknown>(filePath: string): Promise<T | null> {
   try {
     const raw = await readFileFromFs(filePath, "utf8");
@@ -971,6 +980,9 @@ async function runAction(action: string, payload: Record<string, string>): Promi
         return response;
       }
 
+      await mkdir(getOpenClawDir(), { recursive: true });
+      await clearSetupResult("feishu");
+
       const pwEnv = withPlaywrightAutomationEnv(process.env);
       const pnpmPlaywrightCheck = hasPnpm
         ? await runCommand(pnpmCmd, ["exec", "playwright", "--version"], { cwd: projectRoot, env: pwEnv })
@@ -1088,6 +1100,9 @@ async function runAction(action: string, payload: Record<string, string>): Promi
         debugLog("action-finish", { action, ok: response.ok });
         return response;
       }
+
+      await mkdir(getOpenClawDir(), { recursive: true });
+      await clearSetupResult("onething");
 
       const pwEnv = withPlaywrightAutomationEnv(process.env);
       const pnpmPlaywrightCheck = hasPnpm
@@ -2327,6 +2342,13 @@ function commonStyles(): string {
       box-shadow: 0 0 0 2px rgba(90, 124, 255, 0.6);
       transition: box-shadow 0.25s ease;
     }
+    .flow-steps { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 14px 0; }
+    .flow-step { background:#0d1630; border:1px solid #2c3c70; border-radius:12px; padding:12px; }
+    .flow-step strong { display:block; color:#eef2ff; margin-bottom:4px; }
+    .flow-step span { color:#9eb0df; font-size:12px; line-height:1.45; }
+    .flow-step.is-ready { border-color:rgba(142,240,170,0.65); box-shadow:0 0 0 1px rgba(142,240,170,0.18) inset; }
+    .flow-step.is-active { border-color:rgba(255,209,102,0.75); box-shadow:0 0 0 1px rgba(255,209,102,0.22) inset; }
+    .notice { border:1px solid rgba(90,124,255,0.42); background:rgba(90,124,255,0.12); color:#cbd7ff; border-radius:10px; padding:10px 12px; margin:12px 0; }
     .grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
     .card { background: #101a35; border: 1px solid #2c3c70; border-radius: 12px; padding: 14px; }
     .card h2 { margin: 0 0 8px; font-size: 18px; }
@@ -2429,7 +2451,7 @@ function commonStyles(): string {
       from { opacity: 0; transform: translateY(12px) scale(0.98); }
       to { opacity: 1; transform: none; }
     }
-    @media (max-width: 920px) { .grid, .row, .chatInput { grid-template-columns: 1fr; } }
+    @media (max-width: 920px) { .grid, .row, .chatInput, .flow-steps { grid-template-columns: 1fr; } }
   `;
 }
 
@@ -2608,6 +2630,7 @@ function renderControlPage(configPath: string, config: OpenClawConfig, state: Ru
   const configErrorHtml = configErrors.length
     ? configErrors.map((e) => `• ${escapeHtml(e)}`).join("<br/>")
     : "";
+  const configReady = configErrors.length === 0;
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -2625,6 +2648,25 @@ function renderControlPage(configPath: string, config: OpenClawConfig, state: Ru
     <h1>OpenClaw 管理工具</h1>
     <p class="sub">配置管理页面（模型、通道、运维、技能安装）。</p>
     <div class="small">配置文件: <code>${escapeHtml(configPath)}</code></div>
+    <div class="flow-steps" aria-label="OpenClaw setup flow">
+      <div class="flow-step ${state.openclawInstalled ? "is-ready" : "is-active"}">
+        <strong>1. 安装 OpenClaw</strong>
+        <span>${state.openclawInstalled ? "已检测到 openclaw，可继续配置。" : "点击安装会复制本地源码并安装到目标目录。"}</span>
+      </div>
+      <div class="flow-step ${configReady ? "is-ready" : state.openclawInstalled ? "is-active" : ""}">
+        <strong>2. 自动获取凭据</strong>
+        <span>OneThingAI 获取 API Key；飞书创建/选择机器人并捕获 App/Secret/Webhook。</span>
+      </div>
+      <div class="flow-step ${state.daemonReady ? "is-ready" : configReady ? "is-active" : ""}">
+        <strong>3. 保存并应用配置</strong>
+        <span>自动化成功后会回填表单并写入配置文件，再保存应用 daemon。</span>
+      </div>
+      <div class="flow-step ${state.gatewayRunning ? "is-ready" : state.daemonReady ? "is-active" : ""}">
+        <strong>4. 启动 Gateway</strong>
+        <span>${state.gatewayRunning ? "Gateway 已运行。" : "Daemon 就绪后可启动 Gateway 或打开官方 Dashboard。"}</span>
+      </div>
+    </div>
+    <div class="notice">提示：OneThingAI/飞书登录、验证码、租户授权仍需要人工在弹出的 Chromium 窗口中确认；完成后本工具会自动轮询结果、回填控制页，并写入配置文件。</div>
 
     <div class="grid">
       <section class="card">
@@ -2658,10 +2700,10 @@ function renderControlPage(configPath: string, config: OpenClawConfig, state: Ru
 
     <section class="card" id="section-guide" style="margin-top:12px;">
       <h2>第一步引导</h2>
-      <p class="sub">先完成模型与通道配置，再保存配置以安装 daemon。模型可跳转 OneThingAI，飞书可自动打开本地浏览器引导。</p>
+      <p class="sub">推荐顺序：安装 OpenClaw → OneThingAI 模型凭据 → 飞书机器人凭据 → 保存配置 → 启动 Gateway。</p>
       <button id="guideStepOneBtn" class="secondary">第一步：去模型/通道配置</button>
       <button id="guideModelBtn" class="secondary">模型配置引导（OneThingAI）</button>
-      <button id="guideFeishuBtn" class="secondary" ${requiresInstallDisabled}>飞书配置引导（自动打开浏览器）</button>
+      <button id="guideFeishuBtn" class="secondary">飞书配置引导（自动打开浏览器）</button>
     </section>
 
     <section class="card" id="section-basic-config" style="margin-top:12px;">
@@ -2733,7 +2775,7 @@ function renderControlPage(configPath: string, config: OpenClawConfig, state: Ru
              </p>`
           : ""
       }
-      <button class="secondary" id="feishuSetupBtn" ${requiresInstallDisabled}>配置飞书（Playwright）</button>
+      <button class="secondary" id="feishuSetupBtn">配置飞书（Playwright）</button>
       <p id="result"></p>
       <div id="logs">Action logs appear here.</div>
     </section>
@@ -3148,7 +3190,12 @@ function renderControlPage(configPath: string, config: OpenClawConfig, state: Ru
       // Merge/append model entry into modelsJson array.
       const entry = data.modelEntryToEnsure;
       if (entry) {
-        const list = parseModelsJson();
+        let list = [];
+        try {
+          list = parseModelsJson();
+        } catch {
+          list = [];
+        }
         const next = ensureModelEntry(list, entry);
         document.getElementById("modelsJson").value = JSON.stringify(next, null, 2);
       }
@@ -3157,8 +3204,10 @@ function renderControlPage(configPath: string, config: OpenClawConfig, state: Ru
     const applyFeishuAutoFill = (data) => {
       const fields = data.fields || {};
       const feishu = fields.feishu || {};
+      if (feishu.enabled !== undefined) document.getElementById("feishuEnabled").checked = Boolean(feishu.enabled);
       if (feishu.appId !== undefined) document.getElementById("feishuAppId").value = feishu.appId;
       if (feishu.appSecret !== undefined) document.getElementById("feishuAppSecret").value = feishu.appSecret;
+      if (feishu.botName !== undefined) document.getElementById("feishuBotName").value = feishu.botName;
       if (feishu.webhookUrl !== undefined) document.getElementById("feishuWebhookUrl").value = feishu.webhookUrl;
     };
 
@@ -3222,7 +3271,7 @@ function renderControlPage(configPath: string, config: OpenClawConfig, state: Ru
         if (applyData.logs) setLogs(applyData.logs);
         if (maintenanceModalStatusText) {
           maintenanceModalStatusText.textContent =
-            applyData.title || "已回填到表单，可在下方核对后保存配置。";
+            applyData.title || "已回填到表单并写入配置文件，可在下方核对后继续保存/应用。";
         }
         if (maintenanceModalLogs && applyData.logs) {
           maintenanceModalLogs.textContent = applyData.logs;
@@ -4051,13 +4100,34 @@ export async function runConfigureUiCommand(options: ConfigureUiCommandOptions):
           maxTokens: 8192,
           reasoning: false,
         };
+        existing = {
+          ...existing,
+          models: {
+            ...existing.models,
+            provider: "onethingai",
+            baseUrl: "https://api-model.onethingai.com/v2/openai",
+            apiKeyEnv: "ONETHINGAI_API_KEY",
+            defaultModel: "onethingai/minimax-m2.1",
+            list: [
+              ...existing.models.list.filter((model) => model.id !== modelEntryToEnsure.id),
+              modelEntryToEnsure,
+            ],
+          },
+        };
+        await saveConfig(configPath, existing);
+        if (envOut) {
+          await writeFile(envOut, toEnv(existing), "utf8");
+        }
 
         res.setHeader("content-type", "application/json");
         res.end(
           JSON.stringify({
             ok: true,
             title: "OneThing 配置已自动回填",
-            logs: "已回填模型配置，并写入 ~/.openclaw/.env：ONETHINGAI_API_KEY（已隐藏）",
+            logs:
+              `已回填模型配置并写入 ${configPath}。\n` +
+              `已写入 ${envPath}：ONETHINGAI_API_KEY=${maskSecret(apiKey)}。\n` +
+              (envOut ? `已同步 env 输出文件: ${envOut}` : ""),
             fields: {
               models: {
                 provider: "onethingai",
@@ -4112,6 +4182,7 @@ export async function runConfigureUiCommand(options: ConfigureUiCommandOptions):
 
     if (req.method === "POST" && req.url === "/automation/feishu/apply") {
       try {
+        const body = await readBody(req);
         const result = await tryReadJsonFile<any>(getOpenClawSetupResultPath("feishu"));
         if (!result) {
           res.statusCode = 404;
@@ -4123,6 +4194,7 @@ export async function runConfigureUiCommand(options: ConfigureUiCommandOptions):
         const appId = typeof result?.captured?.appId === "string" ? result.captured.appId.trim() : "";
         const appSecret = typeof result?.captured?.appSecret === "string" ? result.captured.appSecret.trim() : "";
         const webhookUrl = typeof result?.captured?.webhookUrl === "string" ? result.captured.webhookUrl.trim() : "";
+        const botName = (asString(body.botName) ?? existing.channels.feishu.botName ?? existing.feishu.botName).trim();
 
         if (!appId || !appSecret || !webhookUrl) {
           res.statusCode = 400;
@@ -4137,15 +4209,49 @@ export async function runConfigureUiCommand(options: ConfigureUiCommandOptions):
           return;
         }
 
+        existing = {
+          ...existing,
+          channels: {
+            ...existing.channels,
+            feishu: {
+              ...existing.channels.feishu,
+              enabled: true,
+              appId,
+              appSecret,
+              botName: botName || "OpenClaw 助手",
+              webhookUrl,
+            },
+          },
+          feishu: {
+            ...existing.feishu,
+            appId,
+            appSecret,
+            botName: botName || "OpenClaw 助手",
+            webhookUrl,
+          },
+        };
+        await saveConfig(configPath, existing);
+        if (envOut) {
+          await writeFile(envOut, toEnv(existing), "utf8");
+        }
+
         res.setHeader("content-type", "application/json");
         res.end(
           JSON.stringify({
             ok: true,
             title: "飞书配置已自动回填",
+            logs:
+              `已回填飞书配置并写入 ${configPath}。\n` +
+              `App ID: ${appId}\n` +
+              `App Secret: ${maskSecret(appSecret)}\n` +
+              `Webhook: ${maskSecret(webhookUrl, 36, 6)}` +
+              (envOut ? `\n已同步 env 输出文件: ${envOut}` : ""),
             fields: {
               feishu: {
+                enabled: true,
                 appId,
                 appSecret,
+                botName: botName || "OpenClaw 助手",
                 webhookUrl,
               },
             },
